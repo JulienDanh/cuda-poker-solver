@@ -70,6 +70,8 @@ class RiverSolver {
   void solve(int iterations, const std::string& algo);
 
   NodeStats stats() const { return stats_; }
+  // Range-weighted average frequencies of the root (OOP) actions.
+  std::vector<double> rootStrategy() const;
   int numNodes() const { return numNodes_; }
   int nCombos(int player) const { return sides_[player].n; }
   void dumpTree(std::FILE* f) const;

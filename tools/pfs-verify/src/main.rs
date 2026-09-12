@@ -112,6 +112,29 @@ fn run_solve(game: &mut PostFlopGame, pot: i32, iters: u32, target: f32) -> Resu
     game.allocate_memory(false);
     let expl = solve(game, iters, target, false);
     game.cache_normalized_weights();
+    // Aggregate root (OOP) strategy: strategy() covers the root player's
+    // hands; weights come from normalized_weights(0).
+    {
+        let hands = game.private_cards(0);
+        let strategy = game.strategy();
+        let w = game.normalized_weights(0);
+        let num_hands = hands.len();
+        let num_actions = strategy.len() / num_hands;
+        let mut wsum = 0.0;
+        let mut freq = vec![0.0f32; num_actions];
+        for i in 0..num_hands {
+            for a in 0..num_actions {
+                freq[a] += w[i] * strategy[a * num_hands + i];
+            }
+            wsum += w[i];
+        }
+        print!("ROOTSTRAT");
+        for f in &mut freq {
+            *f /= wsum;
+            print!(" {:.6}", f);
+        }
+        println!();
+    }
     for p in 0..2 {
         let ev = game.expected_values(p);
         let w = game.normalized_weights(p);

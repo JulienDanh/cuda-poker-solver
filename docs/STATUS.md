@@ -130,7 +130,34 @@ Last updated: after commit aab9688 (multi-street play).
 15. ICM multiway equilibria are validated structurally, not against an
     external reference (none exists in the toolchain).
 
-## 3. Recommended next steps
+## 3. Quality harness (the gates for performance work)
+
+The performance phase must not regress quality. Three gates, all wired
+into the Makefile:
+
+- `make test` — 33 unit tests: engine invariants (EV-sum-to-pot at every
+  iteration, hand-derived uniform-strategy values, tie-board equilibrium),
+  range parser, evaluator cross-check, poker state machine, Kuhn/MCCFR
+  convergence.
+- `make river-parity` — head-to-head vs postflop-solver on 8 spots x 3
+  geometries: EV within 0.01 chips, exploitability ratio within [0.5, 2.0]
+  (measured cross-arithmetic noise band: 0.88-1.48), root strategy within
+  0.10 per action. Requires cargo.
+- `make river-quality` — oracle-free golden baseline (12 spot/iteration
+  points) + monotone-convergence ladder. The solver is deterministic, so
+  EV diffs are exactly 0 today: any drift trips immediately. After an
+  INTENTIONAL quality change: `make river-baseline` regenerates.
+- `make river-bench` — performance tracker (currently ~41k iters/s small
+  spot, ~3k iters/s wide-config spot).
+
+Workflow for any performance change:
+    make test river-parity river-quality   # must pass
+    make river-bench                       # before/after numbers
+The exploitability gates are deliberately loose (2x) because they
+compare at fixed iteration counts where f64-vs-f32 convergence wobble
+is real; the EV gates (0.02 chips absolute) are the tight ones.
+
+## 4. Recommended next steps
 
 First goal: **parity with postflop-solver as a range-based postflop
 solver**. Research in docs/solver-algorithms.md concluded. Status: the

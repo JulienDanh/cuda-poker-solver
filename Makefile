@@ -12,7 +12,7 @@ SRCS := src/cards.cpp src/common.cpp src/eval.cpp src/fgs.cpp src/hand169.cpp \
 HEADERS := $(wildcard src/*.h)
 BUILD := build
 
-.PHONY: all test verify-pfs stub-bias river-parity clean
+.PHONY: all test verify-pfs stub-bias river-parity river-quality river-baseline river-bench clean
 
 all: $(BUILD)/ppsolve $(BUILD)/pfflop
 
@@ -48,6 +48,18 @@ stub-bias:
 # b-inary/postflop-solver (requires cargo).
 river-parity:
 	tools/pfs-verify/check_river_parity.sh
+
+# Golden-baseline quality gate (no oracle needed) + monotone convergence.
+river-quality:
+	tools/quality/river_quality.sh
+
+# Regenerate the golden baseline after an intentional quality change.
+river-baseline:
+	tools/quality/river_quality.sh --generate
+
+# River solver performance benchmark.
+river-bench:
+	tools/quality/bench_river.sh
 
 clean:
 	rm -rf $(BUILD)

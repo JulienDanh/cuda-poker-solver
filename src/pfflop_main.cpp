@@ -90,11 +90,14 @@ int main(int argc, char** argv) {
   int iters = std::stoi(argv[9]);
   std::string algo = "dcfr";
   bool dumpTree = false;
+  bool rootStrat = false;
   for (int i = 10; i < argc; ++i) {
     if (std::strcmp(argv[i], "--algo") == 0 && i + 1 < argc) {
       algo = argv[++i];
     } else if (std::strcmp(argv[i], "--dump-tree") == 0) {
       dumpTree = true;
+    } else if (std::strcmp(argv[i], "--root") == 0) {
+      rootStrat = true;
     }
   }
 
@@ -103,6 +106,12 @@ int main(int argc, char** argv) {
     solver.dumpTree(stdout);
   }
   solver.solve(iters, algo);
+  if (rootStrat) {
+    auto rs = solver.rootStrategy();
+    std::printf("ROOTSTRAT");
+    for (double f : rs) std::printf(" %.6f", f);
+    std::printf("\n");
+  }
   auto st = solver.stats();
   std::printf("EV 0 %.6f\n", st.ev0);
   std::printf("EV 1 %.6f\n", st.ev1);

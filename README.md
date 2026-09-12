@@ -106,6 +106,12 @@ make verify-pfs   # evaluator ordering cross-check (N random 7-card hands)
 make stub-bias    # FGS stub EV-bias measurement vs full postflop solves
 ```
 
+For the range-based river solver (pfflop), the quality gates are:
+`make river-parity` (head-to-head vs the oracle: EV, exploitability band,
+root strategy), `make river-quality` (deterministic golden baseline +
+monotone convergence), `make river-bench` (performance tracking).
+See docs/STATUS.md for the harness design and tolerances.
+
 **Evaluator cross-check** (`tools/verify_eval7.cpp` + `pfs-verify eval7`):
 for millions of random 7-card hands, our `evaluate7` total order and their
 `Hand::evaluate()` total order must agree exactly (equal hands equal,

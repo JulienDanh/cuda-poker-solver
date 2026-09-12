@@ -659,6 +659,23 @@ void RiverSolver::brRec(int nodeIdx, int br, const double* reachOpp,
   }
 }
 
+std::vector<double> RiverSolver::rootStrategy() const {
+  const Node& nd = nodes_[0];
+  if (nd.kind != Node::DECIDE) return {};
+  int n = sides_[0].n;
+  int na = static_cast<int>(nd.actions.size());
+  std::vector<double> sigma(static_cast<size_t>(na) * n, 0.0);
+  avgStrategy(nd, n, sigma.data());
+  std::vector<double> freq(na, 0.0);
+  double z = 0.0;
+  for (int c = 0; c < n; ++c) z += sides_[0].w[c];
+  for (int a = 0; a < na; ++a) {
+    for (int c = 0; c < n; ++c) freq[a] += sides_[0].w[c] * sigma[static_cast<size_t>(a) * n + c];
+    freq[a] /= z;
+  }
+  return freq;
+}
+
 void RiverSolver::computeStats() {
   int n0 = sides_[0].n, n1 = sides_[1].n;
   // Disjoint pair mass Z = sum over disjoint pairs of w0*w1.
