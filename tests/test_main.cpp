@@ -430,6 +430,24 @@ PokerGame::Config chipConfig(int numPlayers, int64_t stack, int64_t ante,
   return cfg;
 }
 
+// Multi-street variant: flop/turn/river betting, no FGS stub.
+PokerGame::Config postflopConfig(int numPlayers, int64_t stack, int64_t ante,
+                                  ContinuationModel* cont) {
+  auto cfg = chipConfig(numPlayers, stack, ante, cont);
+  cfg.postflop = true;
+  return cfg;
+}
+
+const PokerGame::Action* findAction(const std::vector<PokerGame::Action>& acts,
+                                    PokerGame::Action::Type t, int64_t raiseTo = -1) {
+  for (const auto& a : acts) {
+    if (a.type != t) continue;
+    if (t == PokerGame::Action::RAISE && a.raiseTo != raiseTo) continue;
+    return &a;
+  }
+  return nullptr;
+}
+
 // Deal cards deterministically and enter the betting stage.
 PokerGame::State dealtState(const PokerGame& game, RNG& rng) {
   return game.sampleChance(game.rootState(), rng);
@@ -446,7 +464,7 @@ TEST(PokerInitialState) {
   CHECK(!game.isChance(s));
   CHECK(game.currentPlayer(s) == 3);  // UTG first to act
   CHECK(s.pendingActors == 8);
-  CHECK(s.currentBet == 1000);
+  CHECK(s.streetBet == 1000);
   // Antes: 8 * 125 + blinds 500 + 1000 = 2500 total in pot.
   int64_t pot = 0;
   for (int i = 0; i < 8; ++i) pot += s.contributed[i];
@@ -675,6 +693,180 @@ TEST(ChipContinuationZeroSumAndMagnitude) {
   // Each player contributed 2500; whoever wins the 5000 pot nets +2500
   // under the showdown stub. Expected values must lie in [-2500, +2500].
   CHECK(p0 >= -2500.0 - 1e-9 && p0 <= 2500.0 + 1e-9);
+}
+
+// ------------------------------------------------ postflop (multi-street) ---
+
+TEST(PostflopCheckThroughAllStreets) {
+  PokerGame game(postflopConfig(2, 50000, 0, nullptr));
+  RNG rng(31);
+  PokerGame::State s = game.sampleChance(game.rootState(), rng);
+  // SB completes, BB checks.
+  s = game.apply(s, *findAction(game.legalActions(s), PokerGame::Action::MATCH));
+  CHECK(game.currentPlayer(s) == 1);
+  s = game.apply(s, *findAction(game.legalActions(s), PokerGame::Action::MATCH));
+  // Street ended with two chip holders -> flop chance.
+  CHECK(game.isChance(s));
+  s = game.sampleChance(s, rng);
+  CHECK(s.street == 1);
+  CHECK(s.boardDealt == 3);
+  CHECK(game.currentPlayer(s) == 1);  // BB first postflop
+  CHECK(s.streetBet == 0);
+  // Check-check on flop, turn, river.
+  for (int street = 1; street <= 3; ++street) {
+    CHECK(s.street == street);
+    for (int i = 0; i < 2; ++i) {
+      CHECK(!game.isTerminal(s) && !game.isChance(s));
+      s = game.apply(s, *findAction(game.legalActions(s), PokerGame::Action::MATCH));
+    }
+    if (street < 3) {
+      CHECK(game.isChance(s));
+      s = game.sampleChance(s, rng);
+    }
+  }
+  CHECK(s.boardDealt == 5);
+  CHECK(game.isTerminal(s));
+  CHECK(s.terminalKind == 2);
+  double p0 = game.payoff(s, 0);
+  double p1 = game.payoff(s, 1);
+  CHECK_NEAR(p0 + p1, 0.0, 1e-9);
+  // Winner takes the 2000-chip pot (each contributed 1000).
+  double winner = std::max(p0, p1);
+  CHECK_NEAR(winner, 1000.0, 1e-9);
+}
+
+TEST(PostflopBetCallThenShowdown) {
+  PokerGame game(postflopConfig(2, 50000, 0, nullptr));
+  RNG rng(32);
+  PokerGame::State s = game.sampleChance(game.rootState(), rng);
+  s = game.apply(s, *findAction(game.legalActions(s), PokerGame::Action::MATCH));
+  s = game.apply(s, *findAction(game.legalActions(s), PokerGame::Action::MATCH));
+  s = game.sampleChance(s, rng);  // flop
+  // BB bets 0.75 pot = 1500 into 2000.
+  s = game.apply(s, *findAction(game.legalActions(s), PokerGame::Action::RAISE, 1500));
+  CHECK(game.currentPlayer(s) == 0);
+  s = game.apply(s, *findAction(game.legalActions(s), PokerGame::Action::MATCH));
+  CHECK(game.isChance(s));
+  s = game.sampleChance(s, rng);  // turn
+  CHECK(s.street == 2);
+  CHECK(s.streetBet == 0);
+  CHECK(s.contributed[0] == 2500 && s.contributed[1] == 2500);
+  // Check-check turn and river, showdown.
+  s = game.apply(s, *findAction(game.legalActions(s), PokerGame::Action::MATCH));
+  s = game.apply(s, *findAction(game.legalActions(s), PokerGame::Action::MATCH));
+  s = game.sampleChance(s, rng);  // river
+  s = game.apply(s, *findAction(game.legalActions(s), PokerGame::Action::MATCH));
+  s = game.apply(s, *findAction(game.legalActions(s), PokerGame::Action::MATCH));
+  CHECK(game.isTerminal(s));
+  CHECK_NEAR(game.payoff(s, 0) + game.payoff(s, 1), 0.0, 1e-9);
+}
+
+TEST(PostflopFoldToBetReturnsUncalled) {
+  PokerGame game(postflopConfig(2, 50000, 0, nullptr));
+  RNG rng(33);
+  PokerGame::State s = game.sampleChance(game.rootState(), rng);
+  s = game.apply(s, *findAction(game.legalActions(s), PokerGame::Action::MATCH));
+  s = game.apply(s, *findAction(game.legalActions(s), PokerGame::Action::MATCH));
+  s = game.sampleChance(s, rng);  // flop
+  s = game.apply(s, *findAction(game.legalActions(s), PokerGame::Action::RAISE, 1500));
+  s = game.apply(s, *findAction(game.legalActions(s), PokerGame::Action::FOLD));
+  CHECK(game.isTerminal(s));
+  CHECK(s.terminalKind == 1);
+  // BB nets +1000 (the SB's preflop contribution); the uncalled flop bet
+  // returns to BB.
+  CHECK(s.finalStack[1] == 50000 + 1000);
+  CHECK(s.finalStack[0] == 50000 - 1000);
+  CHECK(s.finalStack[0] == 50000 - 1000);
+}
+
+TEST(PostflopAllInRunoutStillWorks) {
+  PokerGame game(postflopConfig(2, 5000, 0, nullptr));
+  RNG rng(34);
+  PokerGame::State s = game.sampleChance(game.rootState(), rng);
+  s = game.apply(s, *findAction(game.legalActions(s), PokerGame::Action::RAISE, 5000));
+  s = game.apply(s, *findAction(game.legalActions(s), PokerGame::Action::MATCH));
+  CHECK(game.isChance(s));
+  s = game.sampleChance(s, rng);  // runout deals all remaining board cards
+  CHECK(game.isTerminal(s));
+  CHECK(s.terminalKind == 2);
+  CHECK(s.boardDealt == 5);
+  CHECK_NEAR(game.payoff(s, 0) + game.payoff(s, 1), 0.0, 1e-9);
+}
+
+TEST(PostflopAnteCallAccounting) {
+  // Regression for the ante-absorption bug: a preflop call must cost the
+  // full blind, not blind-minus-ante (antes are pot money, not bets).
+  PokerGame game(postflopConfig(3, 50000, 125, nullptr));
+  RNG rng(35);
+  PokerGame::State s = game.sampleChance(game.rootState(), rng);
+  // BTN folds, SB calls 500 more, BB checks.
+  s = game.apply(s, *findAction(game.legalActions(s), PokerGame::Action::FOLD));
+  s = game.apply(s, *findAction(game.legalActions(s), PokerGame::Action::MATCH));
+  CHECK(s.contributed[1] == 125 + 500 + 500);  // ante + sb + call
+  s = game.apply(s, *findAction(game.legalActions(s), PokerGame::Action::MATCH));
+  CHECK(game.isChance(s));
+  s = game.sampleChance(s, rng);  // flop
+  CHECK(s.street == 1);
+  CHECK(game.currentPlayer(s) == 1);  // SB acts first postflop (BTN folded)
+  int64_t pot = s.contributed[0] + s.contributed[1] + s.contributed[2];
+  CHECK(pot == 3 * 125 + 1000 + 1000);
+}
+
+TEST(PostflopShortAllInKeepsBetting) {
+  // Three players: BB all-in short on the flop; BTN and SB keep betting.
+  PokerGame::Config cfg = postflopConfig(3, 50000, 0, nullptr);
+  cfg.stacks = {1000, 50000, 50000};  // BTN all-in for the blind level
+  PokerGame game(cfg);
+  RNG rng(36);
+  PokerGame::State s = game.sampleChance(game.rootState(), rng);
+  // BTN calls 1000 all-in; SB and BB check behind.
+  s = game.apply(s, *findAction(game.legalActions(s), PokerGame::Action::MATCH));
+  CHECK(s.allin[0] == 1);
+  s = game.apply(s, *findAction(game.legalActions(s), PokerGame::Action::MATCH));
+  s = game.apply(s, *findAction(game.legalActions(s), PokerGame::Action::MATCH));
+  CHECK(game.isChance(s));
+  s = game.sampleChance(s, rng);  // flop
+  // SB and BTN... BTN is all-in; SB and BB still have chips -> betting.
+  CHECK(!game.isTerminal(s) && !game.isChance(s));
+  CHECK(game.currentPlayer(s) == 1);  // SB first
+  CHECK(s.pendingActors == 2);
+  // Both check through river to showdown with side pots.
+  for (int street = 1; street <= 3; ++street) {
+    for (int i = 0; i < 2; ++i) {
+      s = game.apply(s, *findAction(game.legalActions(s), PokerGame::Action::MATCH));
+    }
+    if (street < 3) s = game.sampleChance(s, rng);
+  }
+  CHECK(game.isTerminal(s));
+  CHECK(s.terminalKind == 2);
+  double sum = game.payoff(s, 0) + game.payoff(s, 1) + game.payoff(s, 2);
+  CHECK_NEAR(sum, 0.0, 1e-9);
+}
+
+TEST(PostflopBucketStability) {
+  PokerGame game(postflopConfig(2, 50000, 0, nullptr));
+  RNG rng(37);
+  PokerGame::State s = game.sampleChance(game.rootState(), rng);
+  s = game.apply(s, *findAction(game.legalActions(s), PokerGame::Action::MATCH));
+  s = game.apply(s, *findAction(game.legalActions(s), PokerGame::Action::MATCH));
+  s = game.sampleChance(s, rng);  // flop
+  int b0 = game.bucketOfPostflop(s, 0);
+  // Force specific hole cards: seat 0 gets a set on this board.
+  PokerGame::State t = s;
+  t.hole[0] = t.board[0];
+  t.hole[1] = t.board[0] == 0 ? 1 : 0;
+  if (t.hole[1] == t.hole[0]) t.hole[1] = 2;
+  int bTrips = game.bucketOfPostflop(t, 0);
+  // Seat 1's bucket is independent of seat 0's hole cards.
+  int b1 = game.bucketOfPostflop(t, 1);
+  int b1orig = game.bucketOfPostflop(s, 1);
+  CHECK(b1 == b1orig);
+  // A trips bucket must differ from a random hand's bucket on some board;
+  // at minimum, the bucket is a deterministic function of hand+board.
+  PokerGame::State t2 = t;
+  t2.hole[1] = (t2.hole[1] + 1) % 52 == t2.hole[0] ? (t2.hole[1] + 2) % 52
+                                                   : (t2.hole[1] + 1) % 52;
+  CHECK(game.bucketOfPostflop(t2, 0) == bTrips);  // same set, same bucket
 }
 
 // Exploitability convergence: on the real heads-up poker game (chip-EV,

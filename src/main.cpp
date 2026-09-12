@@ -31,9 +31,15 @@ struct Args {
   std::string raiseMult = "2.5,3.0";
   int maxBets = 4;
   int contSamples = 16;
+  bool postflop = true;  // preflop+postflop by default; --stub reverts
+  bool postflopExact = false;
+  std::string streetBets = "0.5,0.75,1.0";
+  std::string streetMult = "2.5,3.0";
+  int streetMaxBets = 3;
   bool chipEv = false;
   int explDeals = 0;  // >0: measure HU exploitability after training
   int explBoards = 4;
+  int mcValue = 0;   // >0: Monte-Carlo rollout value of the avg strategy
   bool printUtgOpen = true;
 };
 
@@ -64,8 +70,15 @@ Args parseArgs(int argc, char** argv) {
     else if (s == "--raise-mult") a.raiseMult = next();
     else if (s == "--max-bets") a.maxBets = std::stoi(next());
     else if (s == "--cont-samples") a.contSamples = std::stoi(next());
+    else if (s == "--postflop") a.postflop = true;
+    else if (s == "--stub") a.postflop = false;
+    else if (s == "--postflop-exact") a.postflopExact = true;
+    else if (s == "--street-bets") a.streetBets = next();
+    else if (s == "--street-mult") a.streetMult = next();
+    else if (s == "--street-max-bets") a.streetMaxBets = std::stoi(next());
     else if (s == "--chip-ev") a.chipEv = true;
     else if (s == "--exploitability") a.explDeals = std::stoi(next());
+    else if (s == "--mc-value") a.mcValue = std::stoi(next());
     else if (s == "--expl-boards") a.explBoards = std::stoi(next());
     else if (s == "--help") {
       std::printf(
@@ -73,6 +86,7 @@ Args parseArgs(int argc, char** argv) {
           "               [--ante c] [--payouts p,p,..] [--iters N] [--threads N]\n"
           "               [--buckets 169|15] [--chip-ev] [--exploitability N]\n"
           "               [--open-sizes a,b,c] [--raise-mult a,b] [--max-bets N]\n"
+          "               [--postflop [--postflop-exact] --street-bets a,b]\n"
           "               [--out strategy.csv]\n");
       std::exit(0);
     } else {
@@ -198,6 +212,51 @@ void printUtgRange(const PokerGame& game, int numBuckets,
   }
 }
 
+// Monte-Carlo rollout value of the trained average strategy: sample
+// deals and chance, sample actions from the average strategy, and average
+// the terminal payoffs. Unbiased for any mode (handles all chance stages).
+std::vector<double> mcRolloutValue(
+    const PokerGame& game,
+    const std::unordered_map<uint64_t, InfosetStrategy>& avg, int samples,
+    uint64_t seed) {
+  std::vector<double> sum(game.numPlayers(), 0.0);
+  RNG rng(seed);
+  for (int i = 0; i < samples; ++i) {
+    PokerGame::State s = game.rootState();
+    while (true) {
+      if (game.isTerminal(s)) {
+        for (int p = 0; p < game.numPlayers(); ++p) sum[p] += game.payoff(s, p);
+        break;
+      }
+      if (game.isChance(s)) {
+        s = game.sampleChance(s, rng);
+        continue;
+      }
+      int p = game.currentPlayer(s);
+      auto acts = game.legalActions(s);
+      std::vector<double> sigma(acts.size(), 1.0 / acts.size());
+      auto it = avg.find(game.infosetKey(s, p));
+      if (it != avg.end() &&
+          static_cast<int>(it->second.avg.size()) == static_cast<int>(acts.size())) {
+        sigma = it->second.avg;
+      }
+      double r = rng.nextDouble();
+      double acc = 0.0;
+      size_t pick = acts.size() - 1;
+      for (size_t a = 0; a < acts.size(); ++a) {
+        acc += sigma[a];
+        if (r <= acc) {
+          pick = a;
+          break;
+        }
+      }
+      s = game.apply(s, acts[pick]);
+    }
+  }
+  for (auto& v : sum) v /= samples;
+  return sum;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -222,6 +281,15 @@ int main(int argc, char** argv) {
   for (auto& tok : splitString(a.raiseMult, ',')) cfg.bets.raiseMultipliers.push_back(std::stod(tok));
   cfg.bets.maxBets = a.maxBets;
   cfg.continuationSamples = a.contSamples;
+  cfg.postflop = a.postflop;
+  cfg.postflopAbstraction = a.postflopExact ? 0 : 1;
+  cfg.bets.streetBetSizes.clear();
+  for (auto& tok : splitString(a.streetBets, ','))
+    cfg.bets.streetBetSizes.push_back(std::stod(tok));
+  cfg.bets.streetRaiseMultipliers.clear();
+  for (auto& tok : splitString(a.streetMult, ','))
+    cfg.bets.streetRaiseMultipliers.push_back(std::stod(tok));
+  cfg.bets.streetMaxBets = a.streetMaxBets;
 
   ShowdownContinuation cont;
   cfg.continuation = &cont;
@@ -244,7 +312,21 @@ int main(int argc, char** argv) {
 
   auto avg = solver.averageStrategies();
   std::printf("infosets visited: %zu\n", avg.size());
+  if (a.mcValue > 0) {
+    auto v = mcRolloutValue(game, avg, a.mcValue, 0x5EEDULL);
+    std::printf("mc rollout value (%d samples, bb = %lld):", a.mcValue,
+                static_cast<long long>(cfg.bb));
+    for (int p = 0; p < cfg.numPlayers; ++p)
+      std::printf("  %s %.4f bb", game.positionName(p).c_str(), v[p] / cfg.bb);
+    std::printf("\n");
+  }
   if (a.explDeals > 0) {
+    if (a.postflop) {
+      std::fprintf(stderr,
+                    "exploitability measurement does not support postflop "
+                    "mode (street chances cannot be collapsed analytically)\n");
+      return 1;
+    }
     if (cfg.numPlayers != 2) {
       std::fprintf(stderr,
                     "exploitability is only implemented for heads-up\n");

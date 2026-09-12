@@ -1,18 +1,16 @@
 # cuda-poker-solver
 
-A GPU-oriented poker solver for **8-max tournament NLHE**, built around
-three ideas:
+A GPU-oriented poker solver for **8-max tournament NLHE** that plays the
+full hand — **preflop and postflop** — built around three ideas:
 
 1. **ICM payoffs** — terminal states are evaluated as Malmuth-Harville
    tournament-equity deltas, not chip deltas.
 2. **External-sampling MCCFR** — the equilibrium engine, game-agnostic and
    validated on Kuhn poker against its known equilibrium.
-3. **FGS (Future Game Simulation)** — called pots that reach postflop
-   resolve through a `ContinuationModel` interface, so the preflop solver
-   stays exact while postflop play is modeled rather than fully expanded.
-
-The first milestone targets **8-max preflop solving**; the postflop solver
-that plugs into the FGS interface is future work.
+3. **Multi-street play** — hands run preflop, flop, turn and river with a
+   configurable bet abstraction. `--stub` reverts to the old preflop-only
+   mode where flop-bound pots resolve through an FGS `ContinuationModel`
+   (useful for cheap 8-max preflop runs).
 
 ## Build
 
@@ -70,8 +68,26 @@ Exploitability example (heads-up chip-EV, full abstraction):
 External-sampling MCCFR converges as O(1/sqrt(T)): measured exploitability
 bound halves with 4x iterations (7.3 bb/hand at 60k, 3.7 at 240k).
 
-The solver prints a UTG first-decision range and writes the full visited
-strategy to CSV: `position, history, bucket, action frequencies`.
+The solver prints a UTG first-decision range and writes the visited
+preflop strategy to CSV: `position, history, bucket, action frequencies`
+(the CSV dump enumerates preflop decision nodes; postflop infosets are
+trained but not dumped yet). `--mc-value N` estimates the achieved value
+per seat by Monte-Carlo rollout of the average strategy.
+
+Example comparing modes (heads-up, chip-EV, 150k iterations):
+
+```
+# multi-street (default)
+ppsolve --seats 2 --chip-ev --iters 150000 --mc-value 100000 ...
+#   BTN/SB +0.154 bb, BB -0.154 bb
+
+# FGS-stub preflop-only mode (position-blind showdown continuation)
+ppsolve ... --stub --mc-value 100000
+#   BTN/SB -0.065 bb, BB +0.065 bb
+```
+
+The BTN value flips negative without postflop play, matching the ~4%-of-
+pot IP bias measured against postflop-solver (see below).
 
 ## Verification against b-inary/postflop-solver
 
@@ -123,8 +139,10 @@ src/
 ├── hand169.h/.cpp    169 canonical preflop hands, 15-bucket coarse mode
 ├── showdown.h/.cpp   side-pot layering, uncalled-bet returns, tie splits
 ├── fgs.h/.cpp        ContinuationModel interface + ShowdownContinuation
-├── poker.h/.cpp      8-max tournament NLHE preflop game (blinds, antes,
-│                     min-raise, all-in, board chance, ICM-delta payoffs)
+├── poker.h/.cpp      8-max tournament NLHE multi-street game (blinds,
+│                     antes, min-raise, all-in, street chances, side
+│                     pots, ICM-delta or chip-delta payoffs, postflop
+│                     hand bucketing)
 ├── solver.h          game-agnostic external-sampling MCCFR (templates)
 ├── eval.h/.cpp       HU chip-EV exploitability bound (best-response DP)
 
@@ -202,9 +220,24 @@ expected stacks would be wrong).
 
 The default `ShowdownContinuation` resolves the state as if everyone were
 all-in (sampled boards, layered showdown). This is a documented
-approximation: it ignores position, realization, and postflop play, and
-it overvalues limping/flatting slightly. Plugging in a real postflop
-solver later changes nothing else.
+approximation: it ignores position and realization — measured at ~4% of
+the pot favoring the out-of-position player (see the postflop-solver
+verification section). The default mode no longer uses it: hands play out
+flop/turn/river instead. Pass `--stub` to use it (cheap 8-max runs).
+
+### Postflop play
+
+Streets: preflop betting, flop/turn/river chances with per-street betting
+(`--street-bets`, `--street-mult`, `--street-max-bets`). All-in pots run
+out to showdown exactly; short all-ins keep betting between the covered
+players; side pots layer at showdown as before.
+
+Postflop infosets are bucketed by made-hand category (high card through
+straight flush) x rank tier, per street, on the player's own cards plus
+the current board — 27 buckets. This ignores draws and board texture
+(`--postflop-exact` keys on the exact board instead: no abstraction, but
+a very large infoset space). Preflop infosets keep the 169-hand canonical
+abstraction.
 
 ### Abstraction
 
@@ -232,6 +265,9 @@ with an all-in collapse threshold at 50% of the effective stack.
 
 - [x] Game engine (external-sampling MCCFR, Kuhn-validated)
 - [x] Chip-EV mode + HU exploitability evaluator (convergence-validated)
+- [x] Multi-street preflop+postflop play (flop/turn/river betting, street
+  chances, side pots; BTN EV flips from -0.065 bb to +0.154 bb vs the
+  position-blind stub, matching the measured stub bias)
 - [x] ICM payoffs (Harville subset DP, brute-force-tested)
 - [x] Evaluator cross-validated against postflop-solver (found and fixed
   a double-trips full-house bug; 8M hands, zero violations)
@@ -239,9 +275,10 @@ with an all-in collapse threshold at 50% of the effective stack.
 - [x] FGS continuation interface + showdown stub
 - [x] CLI + CSV strategy dump
 - [ ] Convergence: deeper iterations, weighted regret variants (DCFR)
-- [ ] Postflop solver to replace the continuation stub (real FGS; the
-  stub's OOP bias is measured at ~4% of pot)
+- [ ] Better postflop abstraction (equity clustering: OCHS / k-means)
+- [ ] Postflop strategy output (CSV dump covers preflop only)
 - [ ] Preflop strategies validated against postflop-solver spot solves
+- [ ] CUDA integration into the MCCFR hot loop + validation on hardware
 - [ ] CUDA integration into the MCCFR hot loop + validation on hardware
 - [ ] Exploitability for multiway (3-8 players)
 - [ ] Multi-street FGS-across-hands for tournament dynamics

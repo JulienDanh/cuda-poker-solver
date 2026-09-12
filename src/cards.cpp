@@ -1,6 +1,7 @@
 #include "cards.h"
 
 #include <algorithm>
+#include <cassert>
 
 namespace pps {
 
@@ -26,12 +27,13 @@ bool HandValue::operator==(const HandValue& o) const {
   return true;
 }
 
-HandValue evaluate7(const Card* cards) {
+HandValue evaluateN(const Card* cards, int n) {
+  assert(n >= 5 && n <= 7);
   int rankCount[13] = {0};
   int suitCount[4] = {0};
   int suitRankMask[4] = {0};
   int rankMask = 0;
-  for (int i = 0; i < 7; ++i) {
+  for (int i = 0; i < n; ++i) {
     int r = rankOf(cards[i]);
     int s = suitOf(cards[i]);
     rankCount[r]++;
@@ -159,5 +161,7 @@ HandValue evaluate7(const Card* cards) {
   }
   return v;
 }
+
+HandValue evaluate7(const Card* cards) { return evaluateN(cards, 7); }
 
 }  // namespace pps

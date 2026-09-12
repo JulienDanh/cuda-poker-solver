@@ -18,6 +18,14 @@ int nonFolded(const PokerGame::State& s) {
   for (int i = 0; i < s.numPlayers; ++i) n += s.folded[i] ? 0 : 1;
   return n;
 }
+
+int chipHolders(const PokerGame::State& s) {
+  int n = 0;
+  for (int i = 0; i < s.numPlayers; ++i) {
+    if (!s.folded[i] && !s.allin[i]) ++n;
+  }
+  return n;
+}
 }  // namespace
 
 PokerGame::PokerGame(Config cfg) : cfg_(std::move(cfg)) {
@@ -28,8 +36,16 @@ PokerGame::PokerGame(Config cfg) : cfg_(std::move(cfg)) {
   if (cfg_.numBuckets != kNumHands169 && cfg_.numBuckets != kNumCoarseBuckets) {
     throw std::runtime_error("numBuckets must be 169 or 15");
   }
-  if (cfg_.continuation == nullptr) {
-    throw std::runtime_error("continuation model required (FGS)");
+  if (cfg_.continuation == nullptr && !cfg_.postflop) {
+    throw std::runtime_error("continuation model required (FGS) unless postflop=true");
+  }
+  if (cfg_.postflopAbstraction != 0 && cfg_.postflopAbstraction != 1) {
+    throw std::runtime_error("postflopAbstraction must be 0 (exact) or 1 (buckets)");
+  }
+  if (cfg_.postflop) {
+    if (cfg_.bets.streetBetSizes.empty() || cfg_.bets.streetRaiseMultipliers.empty()) {
+      throw std::runtime_error("postflop mode requires street bet sizes");
+    }
   }
   if (!cfg_.stacks.empty() &&
       static_cast<int>(cfg_.stacks.size()) != cfg_.numPlayers) {
@@ -92,52 +108,67 @@ PokerGame::State PokerGame::rootState() const {
       s.folded[i] = 1;  // busted player: cannot participate
     }
   }
-  // Post antes.
+  // Post antes: antes are pot money, not street bets.
   for (int i = 0; i < cfg_.numPlayers; ++i) {
     if (s.folded[i]) continue;
     int64_t post = std::min(cfg_.ante, s.stack[i]);
     s.stack[i] -= post;
     s.contributed[i] += post;
   }
-  // Post blinds.
+  // Post blinds: blinds are preflop street bets.
   auto post = [&s](int seat, int64_t amt) {
     if (s.folded[seat]) return;
     int64_t p = std::min(amt, s.stack[seat]);
     s.stack[seat] -= p;
     s.contributed[seat] += p;
+    s.streetContrib[seat] += p;
   };
   post(smallBlindSeat(), cfg_.sb);
   post(bigBlindSeat(), cfg_.bb);
   for (int i = 0; i < cfg_.numPlayers; ++i) {
     s.allin[i] = (!s.folded[i] && s.stack[i] == 0) ? 1 : 0;
   }
-  s.currentBet = cfg_.bb;
-  s.lastRaiseIncrement = cfg_.bb;
+  s.streetBet = cfg_.bb;
+  s.minRaiseIncrement = cfg_.bb;
   s.current = (bigBlindSeat() + 1) % cfg_.numPlayers;
   s.pendingActors = 0;
   for (int i = 0; i < cfg_.numPlayers; ++i) {
     if (!s.folded[i] && !s.allin[i]) ++s.pendingActors;
   }
+  s.street = 0;
   s.stage = 0;  // hole-card chance first
   return s;
 }
 
 bool PokerGame::isChance(const State& s) const {
-  return s.stage == 0 || s.stage == 2;
+  return s.stage == 0 || s.stage == 2 || s.stage == 3;
 }
+
+namespace {
+// Deal k distinct cards from the cards not in `used` (52 bitmap).
+void dealUnused(const bool* used, int k, Card* out, RNG& rng) {
+  Card avail[52];
+  int nAvail = 0;
+  for (int c = 0; c < 52; ++c) {
+    if (!used[c]) avail[nAvail++] = static_cast<Card>(c);
+  }
+  for (int i = 0; i < k; ++i) {
+    int j = i + static_cast<int>(rng.nextBelow(static_cast<uint32_t>(nAvail - i)));
+    std::swap(avail[i], avail[j]);
+  }
+  for (int i = 0; i < k; ++i) out[i] = avail[i];
+}
+}  // namespace
 
 PokerGame::State PokerGame::sampleChance(const State& s, RNG& rng) const {
   State n = s;
   if (n.stage == 0) {
-    // Deal 2n distinct cards via partial Fisher-Yates over the full deck.
+    // Deal 2n distinct hole cards via partial Fisher-Yates.
     int need = n.numPlayers * 2;
-    std::array<Card, 52> deck;
-    for (int c = 0; c < 52; ++c) deck[c] = static_cast<Card>(c);
-    for (int i = 0; i < need; ++i) {
-      int j = i + static_cast<int>(rng.nextBelow(52 - i));
-      std::swap(deck[i], deck[j]);
-    }
-    for (int i = 0; i < need; ++i) n.hole[i] = deck[i];
+    bool used[52] = {false};
+    Card hole[16];
+    dealUnused(used, need, hole, rng);
+    for (int i = 0; i < need; ++i) n.hole[i] = hole[i];
     n.cardsDealt = need;
     n.stage = 1;
     // Advance the pointer to the first seat that can actually act.
@@ -151,45 +182,77 @@ PokerGame::State PokerGame::sampleChance(const State& s, RNG& rng) const {
     if (n.pendingActors == 0 || nonFolded(n) == 1) streetEnd(n);
     return n;
   }
-  // stage == 2: deal a 5-card board from the remaining deck.
-  int need = n.numPlayers * 2;
-  std::vector<Card> avail;
-  avail.reserve(52 - need);
-  bool dealt[52] = {false};
-  for (int i = 0; i < need; ++i) dealt[n.hole[i]] = true;
-  for (int c = 0; c < 52; ++c) {
-    if (!dealt[c]) avail.push_back(static_cast<Card>(c));
+  if (n.stage == 2) {
+    // Deal the next street's board cards.
+    int k = (n.street == 0) ? 3 : 1;
+    bool used[52] = {false};
+    for (int i = 0; i < n.numPlayers * 2; ++i) used[n.hole[i]] = true;
+    for (int i = 0; i < n.boardDealt; ++i) used[n.board[i]] = true;
+    Card dealt[3];
+    dealUnused(used, k, dealt, rng);
+    for (int i = 0; i < k; ++i) n.board[n.boardDealt + i] = dealt[i];
+    n.boardDealt += k;
+    ++n.street;
+    n.stage = 1;
+    startStreet(n);
+    return n;
   }
-  for (int i = 0; i < 5; ++i) {
-    int j = i + static_cast<int>(rng.nextBelow(static_cast<uint32_t>(avail.size() - i)));
-    std::swap(avail[i], avail[j]);
-  }
-  for (int i = 0; i < 5; ++i) n.board[i] = avail[i];
+  // stage == 3: runout. Deal the rest of the board, then showdown.
+  assert(n.stage == 3);
+  int k = 5 - n.boardDealt;
+  bool used[52] = {false};
+  for (int i = 0; i < n.numPlayers * 2; ++i) used[n.hole[i]] = true;
+  for (int i = 0; i < n.boardDealt; ++i) used[n.board[i]] = true;
+  Card dealt[5];
+  dealUnused(used, k, dealt, rng);
+  for (int i = 0; i < k; ++i) n.board[n.boardDealt + i] = dealt[i];
   n.boardDealt = 5;
   resolveShowdown(n);
   return n;
 }
 
-bool PokerGame::anyActiveChips(const State& s) const {
-  int withChips = 0;
-  for (int i = 0; i < s.numPlayers; ++i) {
-    if (!s.folded[i] && !s.allin[i]) ++withChips;
+void PokerGame::startStreet(State& s) const {
+  s.streetBet = 0;
+  s.minRaiseIncrement = cfg_.bb;
+  s.raisesSoFar = 0;
+  for (int i = 0; i < s.numPlayers; ++i) s.streetContrib[i] = 0;
+  s.pendingActors = chipHolders(s);
+  // Postflop action starts to the left of the button (the SB seat), i.e.
+  // seat 1 in this layout; heads-up that is the BB.
+  s.current = -1;
+  for (int step = 0; step < s.numPlayers; ++step) {
+    int seat = (1 + step) % s.numPlayers;
+    if (!s.folded[seat] && !s.allin[seat]) {
+      s.current = seat;
+      break;
+    }
   }
-  return withChips >= 2;
+  if (s.pendingActors == 0) streetEnd(s);
 }
 
 void PokerGame::streetEnd(State& s) const {
-  int inHand = 0;
-  for (int i = 0; i < s.numPlayers; ++i) inHand += s.folded[i] ? 0 : 1;
-  if (inHand <= 1) {
+  if (nonFolded(s) <= 1) {
     resolveFoldWin(s);
     return;
   }
-  if (!anyActiveChips(s)) {
-    s.stage = 2;  // board chance, then showdown
+  if (!cfg_.postflop) {
+    // Preflop-only mode: flop-bound pots resolve through the FGS model.
+    if (chipHolders(s) >= 2) {
+      resolveContinuation(s);
+    } else {
+      s.stage = 3;  // runout, then showdown
+    }
     return;
   }
-  resolveContinuation(s);
+  if (s.street >= 3) {
+    resolveShowdown(s);  // river done: board complete
+    return;
+  }
+  if (chipHolders(s) >= 2) {
+    s.stage = 2;  // next street's chance, then betting
+  } else {
+    s.stage = 3;  // no more betting possible: runout
+  }
 }
 
 std::vector<PokerGame::Action> PokerGame::legalActions(const State& s) const {
@@ -197,61 +260,75 @@ std::vector<PokerGame::Action> PokerGame::legalActions(const State& s) const {
   std::vector<Action> acts;
   int me = s.current;
   int64_t behind = s.stack[me];
-  int64_t myContrib = s.contributed[me];
-  int64_t facing = s.currentBet - myContrib;
+  int64_t myStreet = s.streetContrib[me];
+  int64_t myStreetCap = myStreet + behind;
+  int64_t facing = s.streetBet - myStreet;
 
   if (facing > 0) acts.push_back({Action::FOLD, 0});
   acts.push_back({Action::MATCH, 0});
 
-  if (s.raisesSoFar >= cfg_.bets.maxBets) return acts;
+  int maxBets = (s.street == 0) ? cfg_.bets.maxBets : cfg_.bets.streetMaxBets;
+  if (s.raisesSoFar >= maxBets) return acts;
+  if (myStreetCap <= s.streetBet) return acts;  // cannot bet/raise
 
-  int64_t myTotal = behind + myContrib;
-  if (myTotal <= s.currentBet) return acts;  // cannot raise
-  // Cap meaningful raises at the largest opponent total.
+  // Largest meaningful street target: capped by the largest opponent.
   int64_t maxOpp = 0;
   for (int i = 0; i < s.numPlayers; ++i) {
     if (i == me || s.folded[i]) continue;
-    maxOpp = std::max(maxOpp, s.stack[i] + s.contributed[i]);
+    maxOpp = std::max(maxOpp, s.streetContrib[i] + s.stack[i]);
   }
-  int64_t capTo = std::min(myTotal, maxOpp);
-  if (capTo <= s.currentBet) return acts;
+  int64_t capTo = std::min(myStreetCap, maxOpp);
+  if (capTo <= s.streetBet) return acts;
 
-  int64_t minRaiseTo = s.currentBet + s.lastRaiseIncrement;
-  int64_t effTotal = myTotal;
+  int64_t minRaiseTo = s.streetBet + s.minRaiseIncrement;
+  int64_t effStack = myStreetCap;
   for (int i = 0; i < s.numPlayers; ++i) {
     if (i == me || s.folded[i]) continue;
-    effTotal = std::min(effTotal, s.stack[i] + s.contributed[i]);
+    effStack = std::min(effStack, s.streetContrib[i] + s.stack[i]);
   }
   int64_t shoveLine = static_cast<int64_t>(
-      cfg_.bets.shoveThreshold * static_cast<double>(effTotal));
+      cfg_.bets.shoveThreshold * static_cast<double>(effStack));
 
   std::vector<int64_t> candidates;
-  if (s.raisesSoFar == 0) {
-    for (double o : cfg_.bets.openSizes) {
-      candidates.push_back(static_cast<int64_t>(o * cfg_.bb));
+  if (s.street == 0) {
+    if (s.raisesSoFar == 0) {
+      for (double o : cfg_.bets.openSizes) {
+        candidates.push_back(static_cast<int64_t>(o * cfg_.bb));
+      }
+    } else {
+      for (double m : cfg_.bets.raiseMultipliers) {
+        candidates.push_back(static_cast<int64_t>(m * s.streetBet));
+      }
     }
   } else {
-    for (double m : cfg_.bets.raiseMultipliers) {
-      candidates.push_back(static_cast<int64_t>(m * s.currentBet));
+    int64_t pot = 0;
+    for (int i = 0; i < s.numPlayers; ++i) pot += s.contributed[i];
+    if (s.streetBet == 0) {
+      for (double f : cfg_.bets.streetBetSizes) {
+        candidates.push_back(s.streetBet + static_cast<int64_t>(f * pot));
+      }
+    } else {
+      for (double m : cfg_.bets.streetRaiseMultipliers) {
+        candidates.push_back(static_cast<int64_t>(m * s.streetBet));
+      }
     }
   }
+
   std::vector<int64_t> raises;
   for (int64_t c : candidates) {
     int64_t to = std::min(c, capTo);
-    if (to <= s.currentBet) continue;
-    if (to != myTotal && to > shoveLine) continue;  // collapse into all-in
-    if (to < minRaiseTo && to != myTotal) continue;  // below min-raise
+    if (to <= s.streetBet) continue;
+    if (to != myStreetCap && to > shoveLine) continue;  // collapse into all-in
+    if (to < minRaiseTo && to != myStreetCap) continue;  // below min-raise
     bool dup = false;
     for (int64_t r : raises) dup |= (r == to);
     if (!dup) raises.push_back(to);
   }
-  // Always offer the "all-in effective" raise when the effective cap is a
-  // real shove and hasn't been added yet.
-  int64_t shoveTo = std::min(myTotal, capTo);
+  int64_t shoveTo = capTo;
   if (shoveTo > shoveLine) {
     bool dup = false;
     for (int64_t r : raises) dup |= (r == shoveTo);
-    if (!dup && (shoveTo >= minRaiseTo || shoveTo == myTotal)) raises.push_back(shoveTo);
+    if (!dup && (shoveTo >= minRaiseTo || shoveTo == myStreetCap)) raises.push_back(shoveTo);
   }
   std::sort(raises.begin(), raises.end());
   for (int64_t r : raises) acts.push_back({Action::RAISE, r});
@@ -266,23 +343,25 @@ PokerGame::State PokerGame::apply(const State& s, const Action& a) const {
     n.hist[n.nhist++] = 0;
     --n.pendingActors;
   } else if (a.type == Action::MATCH) {
-    int64_t facing = n.currentBet - n.contributed[me];
+    int64_t facing = n.streetBet - n.streetContrib[me];
     int64_t chips = std::min(facing, n.stack[me]);
     n.stack[me] -= chips;
     n.contributed[me] += chips;
+    n.streetContrib[me] += chips;
     if (n.stack[me] == 0) n.allin[me] = 1;
     n.hist[n.nhist++] = 1;
     --n.pendingActors;
-  } else {  // RAISE
-    int64_t to = std::min(a.raiseTo, n.stack[me] + n.contributed[me]);
-    int64_t chips = to - n.contributed[me];
+  } else {  // RAISE (street-level target)
+    int64_t to = std::min(a.raiseTo, n.streetContrib[me] + n.stack[me]);
+    int64_t chips = to - n.streetContrib[me];
     assert(chips >= 0);
     n.stack[me] -= chips;
     n.contributed[me] += chips;
+    n.streetContrib[me] += chips;
     if (n.stack[me] == 0) n.allin[me] = 1;
-    int64_t prevBet = n.currentBet;
-    n.currentBet = std::max(n.currentBet, n.contributed[me]);
-    n.lastRaiseIncrement = std::max(cfg_.bb, n.currentBet - prevBet);
+    int64_t prevBet = n.streetBet;
+    n.streetBet = std::max(n.streetBet, n.streetContrib[me]);
+    n.minRaiseIncrement = std::max(cfg_.bb, n.streetBet - prevBet);
     ++n.raisesSoFar;
     n.hist[n.nhist++] = 0x80000000u | static_cast<uint32_t>(to);
     // Everyone active except the raiser must respond again.
@@ -291,9 +370,7 @@ PokerGame::State PokerGame::apply(const State& s, const Action& a) const {
       if (!n.folded[i] && !n.allin[i] && i != me) ++n.pendingActors;
     }
   }
-  int nonFolded = 0;
-  for (int i = 0; i < n.numPlayers; ++i) nonFolded += n.folded[i] ? 0 : 1;
-  if (n.pendingActors <= 0 || nonFolded == 1) {
+  if (n.pendingActors <= 0 || nonFolded(n) == 1) {
     streetEnd(n);
     return n;
   }
@@ -326,10 +403,11 @@ void PokerGame::resolveFoldWin(State& s) const {
   }
   s.finalStack[winner] += pot;
   s.terminalKind = 1;
-  s.stage = 3;
+  s.stage = 4;
 }
 
 void PokerGame::resolveShowdown(State& s) const {
+  assert(s.boardDealt == 5);
   std::vector<int> inHand;
   for (int i = 0; i < s.numPlayers; ++i) {
     if (!s.folded[i]) inHand.push_back(i);
@@ -338,7 +416,7 @@ void PokerGame::resolveShowdown(State& s) const {
                               s.contributed.data(), inHand);
   for (int i = 0; i < s.numPlayers; ++i) s.finalStack[i] = s.stack[i] + w[i];
   s.terminalKind = 2;
-  s.stage = 3;
+  s.stage = 4;
 }
 
 void PokerGame::resolveContinuation(State& s) const {
@@ -356,7 +434,19 @@ void PokerGame::resolveContinuation(State& s) const {
   uint64_t seed = fnv1a(0xCBF29CE484222325ULL, s.hist.data(), s.nhist * 4);
   s.contOutcomes = cfg_.continuation->continuationEV(ctx, seed);
   s.terminalKind = 3;
-  s.stage = 3;
+  s.stage = 4;
+}
+
+int PokerGame::bucketOfPostflop(const State& s, int player) const {
+  Card cards[7];
+  int n = 2 + s.boardDealt;
+  cards[0] = s.hole[2 * player];
+  cards[1] = s.hole[2 * player + 1];
+  for (int i = 0; i < s.boardDealt; ++i) cards[2 + i] = s.board[i];
+  HandValue v = evaluateN(cards, n);
+  // Rank tier of the primary rank: broadway / mid / low.
+  int tier = v.tiebreak[0] >= 10 ? 2 : (v.tiebreak[0] >= 5 ? 1 : 0);
+  return v.category * 3 + tier;
 }
 
 double PokerGame::icmDelta(
@@ -418,11 +508,26 @@ double PokerGame::payoff(const State& s, int player) const {
 }
 
 uint64_t PokerGame::infosetKey(const State& s, int player) const {
-  int h = handIndex169(s.hole[2 * player], s.hole[2 * player + 1]);
-  int bucket = bucketOf(h, cfg_.numBuckets);
   uint64_t key = 0xCBF29CE484222325ULL;
   key = hashCombine(key, static_cast<uint64_t>(player));
-  key = hashCombine(key, static_cast<uint64_t>(bucket));
+  if (s.street == 0) {
+    int h = handIndex169(s.hole[2 * player], s.hole[2 * player + 1]);
+    int bucket = bucketOf(h, cfg_.numBuckets);
+    key = hashCombine(key, static_cast<uint64_t>(bucket));
+  } else {
+    key = hashCombine(key, static_cast<uint64_t>(s.street));
+    if (cfg_.postflopAbstraction == 0) {
+      // Exact mode: the board and hole cards are part of the key.
+      Card cards[7];
+      cards[0] = s.hole[2 * player];
+      cards[1] = s.hole[2 * player + 1];
+      for (int i = 0; i < s.boardDealt; ++i) cards[2 + i] = s.board[i];
+      key = fnv1a(key, cards, 2 + s.boardDealt);
+    } else {
+      int bucket = bucketOfPostflop(s, player);
+      key = hashCombine(key, static_cast<uint64_t>(bucket));
+    }
+  }
   key = fnv1a(key, s.hist.data(), s.nhist * sizeof(uint32_t));
   return key;
 }

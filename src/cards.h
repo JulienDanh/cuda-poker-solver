@@ -18,10 +18,11 @@ inline int suitOf(Card c) { return c / 13; }
 
 std::string cardName(Card c);
 
-// Best-5-of-7 hand value. Comparison is a total order; the struct is
-// directly comparable: higher is better. category: 8 straight flush,
-// 7 quads, 6 full house, 5 flush, 4 straight, 3 trips, 2 two pair,
-// 1 pair, 0 high card. tiebreak holds 5 kickers/ranks in order.
+// Best-5 hand value from n cards (5 <= n <= 7). Comparison is a total
+// order; the struct is directly comparable: higher is better.
+// category: 8 straight flush, 7 quads, 6 full house, 5 flush, 4 straight,
+// 3 trips, 2 two pair, 1 pair, 0 high card. tiebreak holds 5
+// kickers/ranks in order (unused trailing slots are 0).
 struct HandValue {
   int category = 0;
   std::array<int, 5> tiebreak{};
@@ -29,6 +30,9 @@ struct HandValue {
   bool operator==(const HandValue& o) const;
 };
 
-HandValue evaluate7(const Card* cards /* exactly 7 */);
+HandValue evaluateN(const Card* cards, int n);
+
+// Best-5-of-7 hand value (same rules as evaluateN with n = 7).
+HandValue evaluate7(const Card* cards);
 
 }  // namespace pps

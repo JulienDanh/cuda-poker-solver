@@ -28,15 +28,24 @@ namespace pps {
 constexpr int kMaxPlayers = 8;
 
 struct BetAbstraction {
+  // --- preflop ---
   // Open sizes (in bb) for the first raise of the hand.
   std::vector<double> openSizes = {2.2, 2.5, 3.0};
-  // Later raises, as multiples of the current bet.
+  // Later preflop raises, as multiples of the current bet.
   std::vector<double> raiseMultipliers = {2.5, 3.0};
-  // Max raises (including the open) per hand.
+  // Max raises (including the open) per preflop.
   int maxBets = 4;
-  // If a candidate raise size exceeds this fraction of the effective
-  // stack, only the all-in remains.
+  // If a candidate raise exceeds this fraction of the effective stack,
+  // only the all-in remains.
   double shoveThreshold = 0.5;
+
+  // --- postflop streets ---
+  // Bet sizes as fractions of the current pot.
+  std::vector<double> streetBetSizes = {0.5, 0.75, 1.0};
+  // Raises as multiples of the current street bet.
+  std::vector<double> streetRaiseMultipliers = {2.5, 3.0};
+  // Max bets+raises per street.
+  int streetMaxBets = 3;
 };
 
 class PokerGame {
@@ -62,6 +71,15 @@ class PokerGame {
     // Boards sampled per continuation (FGS stub) resolution. More boards
     // = less per-history noise in the stub's outcome distribution.
     int continuationSamples = 16;
+    // Multi-street mode: instead of resolving flop-bound pots through the
+    // FGS continuation model, deal the flop/turn/river and continue
+    // betting on each street to showdown. The continuation model is
+    // unused in this mode.
+    bool postflop = false;
+    // Postflop infoset abstraction: 1 = made-hand category x rank tier
+    // (per street); 0 = exact board in the infoset key (no abstraction,
+    // very large infoset space).
+    int postflopAbstraction = 1;
   };
 
   struct Action {
@@ -72,25 +90,29 @@ class PokerGame {
 
   struct State {
     int numPlayers = 0;
-    std::array<int64_t, kMaxPlayers> stack{};       // chips behind
+    std::array<int64_t, kMaxPlayers> stack{};        // chips behind
     std::array<int64_t, kMaxPlayers> contributed{}; // total put in this hand
+    std::array<int64_t, kMaxPlayers> streetContrib{}; // put in current street
     std::array<uint8_t, kMaxPlayers> folded{};
     std::array<uint8_t, kMaxPlayers> allin{};
     int current = 0;
-    int64_t currentBet = 0;
-    int64_t lastRaiseIncrement = 0;
+    int64_t streetBet = 0;  // current street's highest contribution
+    int64_t minRaiseIncrement = 0;
     int pendingActors = 0;
-    int raisesSoFar = 0;
-    // History words: 0=fold 1=check/call, raises 0x80000000|raiseTo.
-    std::array<uint32_t, 40> hist{};
+    int raisesSoFar = 0;    // bets+raises this street (incl. blinds)
+    int street = 0;         // 0 preflop, 1 flop, 2 turn, 3 river
+    // History words: 0=fold 1=check/call, raises 0x80000000|street target.
+    std::array<uint32_t, 64> hist{};
     int nhist = 0;
-    // Cards: hole cards dealt at root chance; board at showdown chance.
+    // Cards: hole cards dealt at root chance; board at street chances.
     std::array<Card, kMaxPlayers * 2> hole{};
     int cardsDealt = 0;  // 0 = hole not dealt, 2n = dealt
     std::array<Card, 5> board{};
     int boardDealt = 0;
-    // Stage machine: 0 = hole-card chance, 1 = betting, 2 = board chance,
-    // 3+ = resolved (terminalKind set).
+    // Stage machine: 0 = hole-card chance, 1 = betting, 2 = street chance
+    // (deal the next street), 3 = runout chance (deal the remaining board
+    // because no more betting is possible), >=4 = resolved (terminalKind
+    // set).
     uint8_t stage = 0;
     // Terminal resolution
     uint8_t terminalKind = 0;  // 0 none, 1 fold-win, 2 showdown, 3 continuation
@@ -121,6 +143,7 @@ class PokerGame {
 
   // Representative hole cards for a canonical hand index (used to build
   // infoset keys for strategy extraction without a sampled deal).
+  int bucketOfPostflop(const State& s, int player) const;  // exposed for tests
   static std::array<Card, 2> representativeCards(int handIdx169);
 
  private:
@@ -132,6 +155,7 @@ class PokerGame {
   void resolveShowdown(State& s) const;
   void resolveContinuation(State& s) const;
   void streetEnd(State& s) const;
+  void startStreet(State& s) const;  // reset per-street betting state
   // Shared payoff core: expected ICM delta given a set of outcomes.
   double icmDelta(const std::vector<std::array<int64_t, kMaxPlayers>>& finalStacks,
                   const std::vector<double>& probs, int player) const;
