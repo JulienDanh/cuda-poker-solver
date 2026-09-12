@@ -79,13 +79,17 @@ HandValue evaluate7(const Card* cards) {
   }
 
   // Quads / full house / trips / two pair / pair / high card from rank counts.
-  int quads = -1, trips = -1;
+  // Note: 7 cards can contain two trip ranks (e.g. 222+444+x), which is a
+  // full house (higher trips over lower trips), and quads+trips is quads.
+  int quads = -1, tripsHi = -1, tripsLo = -1;
   int pairs[13];
   int numPairs = 0;
   for (int r = 12; r >= 0; --r) {
     if (rankCount[r] == 4) quads = r;
-    else if (rankCount[r] == 3) trips = r;
-    else if (rankCount[r] == 2) pairs[numPairs++] = r;
+    else if (rankCount[r] == 3) {
+      if (tripsHi < 0) tripsHi = r;
+      tripsLo = r;
+    } else if (rankCount[r] == 2) pairs[numPairs++] = r;
   }
 
   HandValue v;
@@ -100,10 +104,15 @@ HandValue evaluate7(const Card* cards) {
     }
     return v;
   }
-  if (trips >= 0 && numPairs >= 1) {
+  if (tripsHi >= 0 && (numPairs >= 1 || tripsLo != tripsHi)) {
     v.category = 6;
-    v.tiebreak[0] = trips;
-    v.tiebreak[1] = pairs[0];
+    v.tiebreak[0] = tripsHi;
+    // The "pair" side of the full house is the best available pair or
+    // the lower trips.
+    int pairSide = -1;
+    if (numPairs >= 1) pairSide = pairs[0];
+    if (tripsLo >= 0 && tripsLo != tripsHi) pairSide = std::max(pairSide, tripsLo);
+    v.tiebreak[1] = pairSide;
     return v;
   }
   int sh = straightHigh(rankMask);
@@ -112,12 +121,12 @@ HandValue evaluate7(const Card* cards) {
     v.tiebreak[0] = sh;
     return v;
   }
-  if (trips >= 0) {
+  if (tripsHi >= 0) {
     v.category = 3;
-    v.tiebreak[0] = trips;
+    v.tiebreak[0] = tripsHi;
     int placed = 1;
     for (int r = 12; r >= 0 && placed < 3; --r) {
-      if (r != trips && rankCount[r] > 0) v.tiebreak[placed++] = r;
+      if (r != tripsHi && rankCount[r] > 0) v.tiebreak[placed++] = r;
     }
     return v;
   }

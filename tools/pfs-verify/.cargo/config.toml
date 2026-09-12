@@ -1,0 +1,4 @@
+# Newer rustc promotes postflop-solver's implicit-autoref-through-raw-pointer
+# pattern from a warning to a hard error; cap lints so it builds unpatched.
+[build]
+rustflags = ["--cap-lints=warn"]

@@ -73,6 +73,46 @@ bound halves with 4x iterations (7.3 bb/hand at 60k, 3.7 at 240k).
 The solver prints a UTG first-decision range and writes the full visited
 strategy to CSV: `position, history, bucket, action frequencies`.
 
+## Verification against b-inary/postflop-solver
+
+`tools/pfs-verify` wraps the (archived)
+[b-inary/postflop-solver](https://github.com/b-inary/postflop-solver)
+Rust crate — an independent, production-used postflop solver — and uses it
+two ways (requires `cargo`; the crate is vendored under
+`tools/pfs-verify/third_party/` with a patch that exposes its otherwise
+private hand evaluator):
+
+```
+make verify-pfs   # evaluator ordering cross-check (N random 7-card hands)
+make stub-bias    # FGS stub EV-bias measurement vs full postflop solves
+```
+
+**Evaluator cross-check** (`tools/verify_eval7.cpp` + `pfs-verify eval7`):
+for millions of random 7-card hands, our `evaluate7` total order and their
+`Hand::evaluate()` total order must agree exactly (equal hands equal,
+stronger hands stronger). This check caught a real bug in our evaluator:
+hands with two trip ranks in 7 cards (e.g. `222+444+K`) were misclassified
+as trips instead of a full house — every paired runout with double trips
+was ranked wrong, and no unit test covered it. After the fix: **8 million
+hands, zero ordering violations**.
+
+**FGS stub bias** (`tools/pfs-verify/stub_bias.sh`): compares the
+ShowdownContinuation stub (pure equity split of the flop pot) against a
+full postflop solve of the same spot (pot 500, SPR 4, 60%/all-in + 2.5x
+betting, exploitability ~0.4% of pot). BB is OOP:
+
+| flop | stub EV (BB) | real EV (BB) | bias |
+|---|---|---|---|
+| Qs9h2d | 251.6 | 234.4 | -3.4% of pot |
+| 7h8h9c | 267.4 | 211.4 | -11.2% of pot |
+| KdKc4c | 247.7 | 259.4 | +2.3% of pot |
+
+The stub overvalues the out-of-position player by ~4% of the pot on
+average (it strips position), which is the main reason the preflop
+solver's BTN/SB values come out slightly negative. Replacing the stub
+with a real postflop solve is the intended fix (the `ContinuationModel`
+interface already matches what this engine provides).
+
 ## Architecture
 
 ```
@@ -87,6 +127,12 @@ src/
 │                     min-raise, all-in, board chance, ICM-delta payoffs)
 ├── solver.h          game-agnostic external-sampling MCCFR (templates)
 ├── eval.h/.cpp       HU chip-EV exploitability bound (best-response DP)
+
+tools/
+├── verify_eval7.cpp     evaluator cross-check driver (see make verify-pfs)
+└── pfs-verify/          Rust harness around b-inary/postflop-solver
+    ├── src/main.rs      eval7 / equity / solve subcommands
+    └── third_party/     vendored postflop-solver (AGPL, local patch)
 ├── kuhn.h            Kuhn poker (engine validation)
 └── main.cpp          CLI, strategy extraction, CSV dump
 cuda/
@@ -187,11 +233,15 @@ with an all-in collapse threshold at 50% of the effective stack.
 - [x] Game engine (external-sampling MCCFR, Kuhn-validated)
 - [x] Chip-EV mode + HU exploitability evaluator (convergence-validated)
 - [x] ICM payoffs (Harville subset DP, brute-force-tested)
+- [x] Evaluator cross-validated against postflop-solver (found and fixed
+  a double-trips full-house bug; 8M hands, zero violations)
 - [x] 8-max preflop state machine (blinds, antes, min-raises, side pots)
 - [x] FGS continuation interface + showdown stub
 - [x] CLI + CSV strategy dump
 - [ ] Convergence: deeper iterations, weighted regret variants (DCFR)
-- [ ] Postflop solver to replace the continuation stub (real FGS)
+- [ ] Postflop solver to replace the continuation stub (real FGS; the
+  stub's OOP bias is measured at ~4% of pot)
+- [ ] Preflop strategies validated against postflop-solver spot solves
 - [ ] CUDA integration into the MCCFR hot loop + validation on hardware
 - [ ] Exploitability for multiway (3-8 players)
 - [ ] Multi-street FGS-across-hands for tournament dynamics

@@ -21,3 +21,6 @@ __pycache__/
 .idea/
 .vscode/
 .DS_Store
+
+# Rust build artifacts
+tools/pfs-verify/target/

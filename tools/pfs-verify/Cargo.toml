@@ -1,0 +1,20 @@
+[package]
+name = "pfs-verify"
+version = "0.1.0"
+edition = "2021"
+
+# Harness that uses b-inary/postflop-solver as an independent reference
+# implementation to verify the cuda-poker-solver engine (hand evaluation,
+# equity computation) and to measure the FGS continuation stub's bias.
+#
+# The upstream project is archived (Oct 2023) and does not compile with
+# current toolchains as-is; default-features=false drops its broken
+# optional bincode dependency, and .cargo/config.toml caps lints because
+# newer rustc turned its implicit-autoref pattern into a hard error.
+[dependencies]
+# Vendored (upstream is archived and does not expose its hand evaluator).
+# See third_party/postflop-solver/CHANGES-pfs-verify.md for the local patch.
+postflop-solver = { path = "third_party/postflop-solver", default-features = false, features = ["rayon"] }
+
+[profile.release]
+opt-level = 3

@@ -44,6 +44,20 @@ TEST(HandEvalCategories) {
   CHECK(evaluate7(wheel) < evaluate7(straight));
   Card quadsLow[7] = {C(3, 0), C(3, 1), C(3, 2), C(3, 3), C(2, 0), C(11, 1), C(12, 2)};
   CHECK(evaluate7(quadsLow) < evaluate7(quads));
+  // Two trip ranks in 7 cards = full house (found by cross-validation
+  // against postflop-solver's evaluator; was misclassified as trips).
+  Card doubleTrips[7] = {C(0, 0), C(0, 1), C(0, 2), C(2, 0), C(2, 1), C(2, 2), C(5, 3)};
+  auto dtv = evaluate7(doubleTrips);
+  CHECK(dtv.category == 6);
+  CHECK(dtv.tiebreak[0] == 2 && dtv.tiebreak[1] == 0);  // 444 over 222
+  // Quads + trips is quads with the trips rank as kicker.
+  Card quadsTrips[7] = {C(4, 0), C(4, 1), C(4, 2), C(4, 3), C(2, 0), C(2, 1), C(2, 2)};
+  auto qtv = evaluate7(quadsTrips);
+  CHECK(qtv.category == 7);
+  CHECK(qtv.tiebreak[0] == 4 && qtv.tiebreak[1] == 2);
+  // Higher full house (trips+pair) beats lower double-trips full house.
+  Card fhTripsPair[7] = {C(5, 0), C(5, 1), C(5, 2), C(3, 0), C(3, 1), C(6, 2), C(7, 3)};
+  CHECK(evaluate7(doubleTrips) < evaluate7(fhTripsPair));  // 666-33 > 444-22
 }
 
 // ------------------------------------------------------------------ ICM ---

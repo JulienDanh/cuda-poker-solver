@@ -11,7 +11,7 @@ SRCS := src/cards.cpp src/common.cpp src/eval.cpp src/fgs.cpp src/hand169.cpp \
 HEADERS := $(wildcard src/*.h)
 BUILD := build
 
-.PHONY: all test clean
+.PHONY: all test verify-pfs stub-bias clean
 
 all: $(BUILD)/ppsolve
 
@@ -26,6 +26,19 @@ $(BUILD)/tests: $(SRCS) tests/test_main.cpp tests/framework.h | $(BUILD)
 
 test: $(BUILD)/tests
 	./$(BUILD)/tests
+
+$(BUILD)/verify_eval7: tools/verify_eval7.cpp $(SRCS) $(HEADERS) | $(BUILD)
+	$(CXX) $(CXXFLAGS) $(THREADFLAGS) -Isrc -o $@ tools/verify_eval7.cpp src/cards.cpp src/common.cpp
+
+# Cross-validation of the hand evaluator against b-inary/postflop-solver
+# over N random 7-card hands (requires cargo). See tools/pfs-verify/.
+verify-pfs: $(BUILD)/verify_eval7
+	tools/pfs-verify/check_eval7.sh
+
+# Measures the FGS continuation stub's EV bias against a full postflop
+# solve (see tools/pfs-verify/stub_bias.sh).
+stub-bias:
+	tools/pfs-verify/stub_bias.sh
 
 clean:
 	rm -rf $(BUILD)
