@@ -132,12 +132,23 @@ Last updated: after commit aab9688 (multi-street play).
 
 ## 3. Recommended next steps
 
-1. Postflop equity-clustering abstraction (OCHS or k-means), then
-   re-measure `--mc-value` and spot-check strategies against
-   postflop-solver solves.
-2. DCFR + a flat infoset table (correctness-neutral, big speed win),
-   then a multi-street BR evaluator to quantify postflop exploitability.
-3. Wire and validate the CUDA kernels on real hardware, moving the
-   regret update + equity batch to GPU; benchmark against the CPU path.
-4. Postflop strategy CSV + save/load; then multiway BR and
-   FGS-across-hands as research items.
+First goal: **parity with postflop-solver as a range-based postflop
+solver**. Research in docs/solver-algorithms.md concluded:
+
+1. Build the range-based postflop engine with vanilla **DCFR** using
+   postflop-solver's exact update rules (alternating updates, RM+,
+   alpha_t = t^1.5/(t^1.5+1), beta_t = 0.5, gamma_t with power-of-4
+   reset) so A/B comparisons against the oracle isolate implementation
+   bugs, not algorithm differences. River-only first (no chance nodes),
+   then turn, then flop.
+2. Implement **HS-DCFR(30)** schedules (the 2026 SOTA, ~15 lines on top
+   of DCFR) behind a flag and measure both against the oracle.
+3. Keep sampled MCCFR for 8-max preflop; vanilla DCFR is for spot
+   solving where accuracy is the goal.
+4. When targeting CUDA: compile the game to static dataflow with
+   depth-level batched passes + CUDA Graph replay (the GPU-CFR
+   approach), not per-node kernels; the flat layout is worth adopting
+   on CPU first. A range module (src/range.h/.cpp, postflop-solver
+   syntax subset) is already in place.
+5. Then: equity-clustering abstraction for multi-street MCCFR, postflop
+   strategy CSV + save/load, multiway BR, FGS-across-hands.

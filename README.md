@@ -1,6 +1,7 @@
 # cuda-poker-solver
 
 > Current status and what is missing: [docs/STATUS.md](docs/STATUS.md)
+> Algorithm research (modern CFR variants, GPU approaches): [docs/solver-algorithms.md](docs/solver-algorithms.md)
 
 A GPU-oriented poker solver for **8-max tournament NLHE** that plays the
 full hand — **preflop and postflop** — built around three ideas:
