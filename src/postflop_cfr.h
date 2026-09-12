@@ -83,6 +83,9 @@ class RiverSolver {
     std::vector<double> w;     // range weights
     std::vector<uint64_t> strength;
     std::vector<int> sorted;   // combo indices sorted by strength ascending
+    // sameOther[i]: index into the OTHER side's combo list of the identical
+    // combo (same two cards), or -1.
+    std::vector<int> sameOther;
   };
 
   struct Node {
@@ -119,6 +122,8 @@ class RiverSolver {
   // Showdown values for the traverser given opponent reach.
   void showdownValues(int nodeIdx, int tr, const double* reachOpp,
                       double winV, double tieV, double loseV, double* out) const;
+  // Fast path: disjoint reach mass per traverser combo, O(52 + n).
+  void disjointMass(int tr, const double* reachOpp, double* out) const;
 
   void regretMatching(const Node& nd, int n, double* sigma) const;
 

@@ -6,6 +6,7 @@
 #include <cstdio>
 #include <cstring>
 #include <deque>
+#include <map>
 #include <functional>
 
 namespace pps {
@@ -50,6 +51,31 @@ RiverSolver::RiverSolver(const Spot& spot, const BetConfig& cfg)
       if (s.strength[x] != s.strength[y]) return s.strength[x] < s.strength[y];
       return x < y;
     });
+  }
+  // sameOther maps: identical combos across the two sides.
+  {
+    std::map<uint16_t, int> idx1;
+    for (int i = 0; i < sides_[1].n; ++i) {
+      idx1[(static_cast<uint16_t>(sides_[1].cards[2 * i]) << 8) |
+           sides_[1].cards[2 * i + 1]] = i;
+    }
+    sides_[0].sameOther.assign(sides_[0].n, -1);
+    for (int i = 0; i < sides_[0].n; ++i) {
+      auto it = idx1.find((static_cast<uint16_t>(sides_[0].cards[2 * i]) << 8) |
+                           sides_[0].cards[2 * i + 1]);
+      if (it != idx1.end()) sides_[0].sameOther[i] = it->second;
+    }
+    std::map<uint16_t, int> idx0;
+    for (int i = 0; i < sides_[0].n; ++i) {
+      idx0[(static_cast<uint16_t>(sides_[0].cards[2 * i]) << 8) |
+           sides_[0].cards[2 * i + 1]] = i;
+    }
+    sides_[1].sameOther.assign(sides_[1].n, -1);
+    for (int i = 0; i < sides_[1].n; ++i) {
+      auto it = idx0.find((static_cast<uint16_t>(sides_[1].cards[2 * i]) << 8) |
+                          sides_[1].cards[2 * i + 1]);
+      if (it != idx0.end()) sides_[1].sameOther[i] = it->second;
+    }
   }
   buildTree();
 }
@@ -467,6 +493,26 @@ void RiverSolver::showdownValues(int nodeIdx, int tr, const double* reachOpp,
   }
 }
 
+void RiverSolver::disjointMass(int tr, const double* reachOpp,
+                               double* out) const {
+  const Side& ts = sides_[tr];
+  const Side& os = sides_[tr ^ 1];
+  double minus[52] = {0.0};
+  double total = 0.0;
+  for (int i = 0; i < os.n; ++i) {
+    double r = reachOpp[i];
+    total += r;
+    minus[os.cards[2 * i]] += r;
+    minus[os.cards[2 * i + 1]] += r;
+  }
+  for (int t = 0; t < ts.n; ++t) {
+    double w = total - minus[ts.cards[2 * t]] - minus[ts.cards[2 * t + 1]];
+    int s = ts.sameOther[t];
+    if (s >= 0) w += reachOpp[s];  // identical combo subtracted twice
+    out[t] = w > 0.0 ? w : 0.0;
+  }
+}
+
 // ---------------------------------------------------------------------------
 // CFR pass (alternating half-step for the traverser).
 // ---------------------------------------------------------------------------
@@ -485,12 +531,10 @@ void RiverSolver::passRec(int nodeIdx, int tr, const double* reachOpp,
   }
   if (nd.kind == Node::FOLD) {
     // The fold payoff is hand-independent, but the counterfactual value
-    // carries the opponent's DISJOINT reach mass at this terminal (card-
-    // conflicting combos cannot be dealt; showdowns already restrict to
-    // disjoint mass via the sweep).
+    // carries the opponent's DISJOINT reach mass at this terminal.
     double v = tr == nd.foldBy ? -static_cast<double>(nd.sc[nd.foldBy])
                                : static_cast<double>(spot_.pot + nd.sc[nd.foldBy]);
-    showdownValues(nodeIdx, tr, reachOpp, 1.0, 1.0, 1.0, outVal);
+    disjointMass(tr, reachOpp, outVal);
     for (int c = 0; c < ntr; ++c) outVal[c] *= v;
     return;
   }
@@ -574,7 +618,7 @@ void RiverSolver::evOne(int nodeIdx, int tr, const double* reachOpp,
   if (nd.kind == Node::FOLD) {
     double v = tr == nd.foldBy ? -static_cast<double>(nd.sc[nd.foldBy])
                                : static_cast<double>(spot_.pot + nd.sc[nd.foldBy]);
-    showdownValues(nodeIdx, tr, reachOpp, 1.0, 1.0, 1.0, outVal);
+    disjointMass(tr, reachOpp, outVal);
     for (int c = 0; c < ntr; ++c) outVal[c] *= v;
     return;
   }
@@ -625,7 +669,7 @@ void RiverSolver::brRec(int nodeIdx, int br, const double* reachOpp,
   if (nd.kind == Node::FOLD) {
     double val = br == nd.foldBy ? -static_cast<double>(nd.sc[nd.foldBy])
                                  : static_cast<double>(spot_.pot + nd.sc[nd.foldBy]);
-    showdownValues(nodeIdx, br, reachOpp, 1.0, 1.0, 1.0, v);
+    disjointMass(br, reachOpp, v);
     for (int c = 0; c < nbr; ++c) v[c] *= val;
     return;
   }
@@ -682,8 +726,7 @@ void RiverSolver::computeStats() {
   double Z = 0.0;
   {
     std::vector<double> v(n0, 0.0);
-    // Counting every disjoint opponent combo: win=tie=lose coefficient 1.
-    showdownValues(0, 0, sides_[1].w.data(), 1.0, 1.0, 1.0, v.data());
+    disjointMass(0, sides_[1].w.data(), v.data());
     for (int c = 0; c < n0; ++c) Z += sides_[0].w[c] * v[c];
   }
   if (Z <= 0.0) {
