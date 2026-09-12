@@ -25,6 +25,7 @@ int64_t roundTo(double x) { return static_cast<int64_t>(std::llround(x)); }
 
 RiverSolver::RiverSolver(const Spot& spot, const BetConfig& cfg)
     : spot_(spot), cfg_(cfg) {
+  initScratch();
   for (int p = 0; p < 2; ++p) {
     const Range& r = p == 0 ? spot_.oop : spot_.ip;
     Side& s = sides_[p];
@@ -346,10 +347,8 @@ RiverSolver::Discount RiverSolver::makeDiscount(int t, int iters) const {
 // Regret matching+ / average strategy.
 // ---------------------------------------------------------------------------
 
-void RiverSolver::regretMatching(const Node& nd, int n,
-                                 std::vector<double>& sigma) const {
+void RiverSolver::regretMatching(const Node& nd, int n, double* sigma) const {
   int na = static_cast<int>(nd.actions.size());
-  sigma.assign(static_cast<size_t>(na) * n, 0.0);
   for (int c = 0; c < n; ++c) {
     double sum = 0.0;
     for (int a = 0; a < na; ++a) {
@@ -367,10 +366,8 @@ void RiverSolver::regretMatching(const Node& nd, int n,
   }
 }
 
-void RiverSolver::avgStrategy(const Node& nd, int n,
-                              std::vector<double>& sigma) const {
+void RiverSolver::avgStrategy(const Node& nd, int n, double* sigma) const {
   int na = static_cast<int>(nd.actions.size());
-  sigma.assign(static_cast<size_t>(na) * n, 0.0);
   for (int c = 0; c < n; ++c) {
     double sum = 0.0;
     for (int a = 0; a < na; ++a) sum += nd.stratSum[static_cast<size_t>(a) * n + c];
@@ -388,6 +385,14 @@ void RiverSolver::avgStrategy(const Node& nd, int n,
 // ---------------------------------------------------------------------------
 // Showdown sweep.
 // ---------------------------------------------------------------------------
+
+void RiverSolver::initScratch() {
+  for (int k = 0; k < 4; ++k) {
+    for (int d = 0; d < kMaxDepth; ++d) {
+      scratch_[k][d].assign(kScratchStride, 0.0);
+    }
+  }
+}
 
 void RiverSolver::showdownValues(int nodeIdx, int tr, const double* reachOpp,
                                  double winV, double tieV, double loseV,
@@ -467,7 +472,7 @@ void RiverSolver::showdownValues(int nodeIdx, int tr, const double* reachOpp,
 // ---------------------------------------------------------------------------
 
 void RiverSolver::passRec(int nodeIdx, int tr, const double* reachOpp,
-                          const Discount& d, double* outVal) {
+                          const Discount& d, double* outVal, int depth) {
   Node& nd = nodes_[nodeIdx];
   int ntr = sides_[tr].n;
   if (nd.kind == Node::SHOWDOWN) {
@@ -492,12 +497,13 @@ void RiverSolver::passRec(int nodeIdx, int tr, const double* reachOpp,
 
   int n = sides_[nd.player].n;
   int na = static_cast<int>(nd.actions.size());
-  std::vector<double> sigma;
+  double* sigma = scratch_[0][depth].data();
   regretMatching(nd, n, sigma);
   if (nd.player == tr) {
-    std::vector<double> cfv(static_cast<size_t>(na) * ntr, 0.0);
+    double* cfv = scratch_[1][depth].data();
     for (int a = 0; a < na; ++a) {
-      passRec(nd.children[a], tr, reachOpp, d, &cfv[static_cast<size_t>(a) * ntr]);
+      passRec(nd.children[a], tr, reachOpp, d, cfv + static_cast<size_t>(a) * ntr,
+              depth + 1);
     }
     for (int c = 0; c < ntr; ++c) {
       double v = 0.0;
@@ -525,14 +531,14 @@ void RiverSolver::passRec(int nodeIdx, int tr, const double* reachOpp,
     // Opponent's node: the counterfactual value is the plain sum over
     // actions of the child cfvs; the opponent's strategy enters through
     // the updated cfreach, NOT through an extra marginal probability.
-    std::vector<double> childReach(n, 0.0);
+    double* childReach = scratch_[2][depth].data();
+    double* cv = scratch_[3][depth].data();
     for (int c = 0; c < ntr; ++c) outVal[c] = 0.0;
     for (int a = 0; a < na; ++a) {
       for (int c = 0; c < n; ++c) {
         childReach[c] = reachOpp[c] * sigma[static_cast<size_t>(a) * n + c];
       }
-      std::vector<double> cv(ntr, 0.0);
-      passRec(nd.children[a], tr, childReach.data(), d, cv.data());
+      passRec(nd.children[a], tr, childReach, d, cv, depth + 1);
       for (int c = 0; c < ntr; ++c) outVal[c] += cv[c];
     }
   }
@@ -543,8 +549,8 @@ void RiverSolver::solve(int iterations, const std::string& algo) {
   std::vector<double> rootVal0(sides_[0].n), rootVal1(sides_[1].n);
   for (int t = 0; t < iterations; ++t) {
     Discount d = makeDiscount(t, iterations);
-    passRec(0, 0, sides_[1].w.data(), d, rootVal0.data());
-    passRec(0, 1, sides_[0].w.data(), d, rootVal1.data());
+    passRec(0, 0, sides_[1].w.data(), d, rootVal0.data(), 0);
+    passRec(0, 1, sides_[0].w.data(), d, rootVal1.data(), 0);
   }
   computeStats();
 }
@@ -574,8 +580,9 @@ void RiverSolver::evOne(int nodeIdx, int tr, const double* reachOpp,
   }
   int n = sides_[nd.player].n;
   int na = static_cast<int>(nd.actions.size());
-  std::vector<double> sigma;
-  avgStrategy(nd, n, sigma);
+  // evOne/brRec run once per solve: allocation is irrelevant here.
+  std::vector<double> sigma(static_cast<size_t>(na) * n, 0.0);
+  avgStrategy(nd, n, sigma.data());
   std::vector<double> cfv(static_cast<size_t>(na) * ntr, 0.0);
   if (nd.player == tr) {
     for (int a = 0; a < na; ++a) {
@@ -637,8 +644,8 @@ void RiverSolver::brRec(int nodeIdx, int br, const double* reachOpp,
       v[c] = best;
     }
   } else {
-    std::vector<double> sigma;
-    avgStrategy(nd, n, sigma);
+    std::vector<double> sigma(static_cast<size_t>(na) * n, 0.0);
+    avgStrategy(nd, n, sigma.data());
     for (int c = 0; c < nbr; ++c) v[c] = 0.0;
     for (int a = 0; a < na; ++a) {
       std::vector<double> r(reachOpp, reachOpp + n);

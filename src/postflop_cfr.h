@@ -112,18 +112,18 @@ class RiverSolver {
   // One alternating half-step for `tr`: fills `outVal` with the traverser's
   // counterfactual values given `reachOpp` (opponent combo weights).
   void passRec(int nodeIdx, int tr, const double* reachOpp, const Discount& d,
-               double* outVal);
+               double* outVal, int depth);
 
   // Showdown values for the traverser given opponent reach.
   void showdownValues(int nodeIdx, int tr, const double* reachOpp,
                       double winV, double tieV, double loseV, double* out) const;
 
-  void regretMatching(const Node& nd, int n, std::vector<double>& sigma) const;
+  void regretMatching(const Node& nd, int n, double* sigma) const;
 
   // Final walks.
   void computeStats();
 
-  void avgStrategy(const Node& nd, int n, std::vector<double>& sigma) const;
+  void avgStrategy(const Node& nd, int n, double* sigma) const;
   // Value walk for one traverser with the average strategy (mirrors
   // passRec's structure; values carry the opponent's reach mass and the
   // traverser's own per-combo strategy applied at their own nodes).
@@ -138,6 +138,13 @@ class RiverSolver {
   int numNodes_ = 0;
   NodeStats stats_;
   std::string algo_ = "dcfr";
+  // Depth-indexed scratch buffers (avoids per-recursion heap allocation).
+  // [depth][k]: 0 = sigma (na*n), 1 = cfv (na*ntr), 2 = child reach (n),
+  // 3 = per-action child value (ntr).
+  static constexpr size_t kScratchStride = 8 * 1326;
+  static constexpr int kMaxDepth = 64;
+  std::vector<double> scratch_[4][kMaxDepth];
+  void initScratch();
 };
 
 }  // namespace pf
