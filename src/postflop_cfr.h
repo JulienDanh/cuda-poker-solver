@@ -62,12 +62,42 @@ struct NodeStats {
   int64_t pairMass = 0;  // number of disjoint weighted combo pairs (x2^40)
 };
 
+// Per-context scratch for passRec: three regions of maxNa*maxN doubles per
+// tree depth (sigma, action values, per-action child reach). A context is
+// used with strict stack discipline: a thread's active passRec frames occupy
+// buffers at depths [rootDepth..current], so reusing the same context for
+// deeper serial recursion is safe, while an independent parallel task needs
+// its own context.
+struct PassCtx {
+  static constexpr int kMaxDepth = 32;
+  std::vector<double> buf[kMaxDepth];
+  int maxNa = 0, maxN = 0, depths = 0;
+  void init(int maxNa_, int maxN_, int depths_) {
+    maxNa = maxNa_;
+    maxN = maxN_;
+    depths = depths_;
+    for (int d = 0; d < kMaxDepth; ++d) {
+      if (d < depths)
+        buf[d].assign(3 * static_cast<size_t>(maxNa) * maxN, 0.0);
+      else
+        buf[d].clear();
+    }
+  }
+  double* sigma(int d) { return buf[d].data(); }
+  double* aval(int d) { return buf[d].data() + static_cast<size_t>(maxNa) * maxN; }
+  double* reach(int d) { return buf[d].data() + 2 * static_cast<size_t>(maxNa) * maxN; }
+};
+
 class RiverSolver {
  public:
   RiverSolver(const Spot& spot, const BetConfig& cfg);
 
   // Runs `iterations` full DCFR iterations (two alternating half-steps).
-  void solve(int iterations, const std::string& algo);
+  // threads: 0 = auto (one worker per performance core, serial on tiny
+  // trees), 1 = serial, N >= 2 = N-1 pool workers plus the calling thread.
+  // The parallel path aggregates per-node in fixed action order, so results
+  // are bit-identical to the serial path.
+  void solve(int iterations, const std::string& algo, int threads = 0);
 
   NodeStats stats() const { return stats_; }
   // Range-weighted average frequencies of the root (OOP) actions.
@@ -107,6 +137,8 @@ class RiverSolver {
   int buildNode(int64_t sc0, int64_t sc1, int actor, bool afterAllin, int depth);
   std::vector<TreeAction> possibleActions(int64_t sc0, int64_t sc1,
                                           int actor, bool afterAllin) const;
+  // Subtree node counts and derived spawn gating (parallel passRec).
+  void computeSubNodes();
 
   // DCFR parameters per iteration.
   struct Discount {
@@ -114,10 +146,12 @@ class RiverSolver {
   };
   Discount makeDiscount(int t, int iters) const;
 
+  class ForkPool;  // fork-join task pool (defined in the .cpp)
+
   // One alternating half-step for `tr`: fills `outVal` with the traverser's
   // counterfactual values given `reachOpp` (opponent combo weights).
   void passRec(int nodeIdx, int tr, const double* reachOpp, const Discount& d,
-               double* outVal, int depth);
+               double* outVal, ForkPool* pool, PassCtx& ctx, int depth);
 
   // Showdown values for the traverser given opponent reach.
   void showdownValues(int nodeIdx, int tr, const double* reachOpp,
@@ -145,13 +179,10 @@ class RiverSolver {
   int numNodes_ = 0;
   NodeStats stats_;
   std::string algo_ = "dcfr";
-  // Depth-indexed scratch buffers (avoids per-recursion heap allocation).
-  // [depth][k]: 0 = sigma (na*n), 1 = cfv (na*ntr), 2 = child reach (n),
-  // 3 = per-action child value (ntr).
-  static constexpr size_t kScratchStride = 8 * 1326;
-  static constexpr int kMaxDepth = 64;
-  std::vector<double> scratch_[4][kMaxDepth];
-  void initScratch();
+  // Parallel-passRec bookkeeping.
+  int maxNa_ = 1;            // max actions over DECIDE nodes
+  int maxDepth_ = 0;         // deepest buildNode depth
+  std::vector<int> subNodes_;  // nodes in each node's subtree (incl. self)
 };
 
 }  // namespace pf

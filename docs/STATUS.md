@@ -147,8 +147,8 @@ into the Makefile:
   points) + monotone-convergence ladder. The solver is deterministic, so
   EV diffs are exactly 0 today: any drift trips immediately. After an
   INTENTIONAL quality change: `make river-baseline` regenerates.
-- `make river-bench` — performance tracker (currently ~41k iters/s small
-  spot, ~3k iters/s wide-config spot).
+- `make river-bench` — performance tracker (currently ~51k iters/s small
+  spot, ~7k iters/s wide-config spot).
 
 Workflow for any performance change:
     make test river-parity river-quality   # must pass
@@ -158,6 +158,36 @@ compare at fixed iteration counts where f64-vs-f32 convergence wobble
 is real; the EV gates (0.02 chips absolute) are the tight ones.
 
 ## 4. Recommended next steps
+
+### Performance work log (river solver)
+
+- Fold-terminal fast path: `disjointMass()` (O(52+n) per-card sums +
+  sameOther add-back) replaced the full 3-sweep showdown scan at every
+  fold terminal. Small spot 41k -> ~50k iters/s.
+- Right-sized per-depth scratch (PassCtx): the old fixed-stride
+  (8x1326) scratch put every buffer tens of KB apart; contiguous
+  per-depth regions improved wide-spot serial speed ~2x (3-4k -> 7-8k
+  iters/s).
+- Parallel passRec (fork-join, opt-out via `--threads`): a DECIDE node
+  with enough subtree work fans out per-action child evaluations as
+  jobs over a work-sharing pool; aggregation is in fixed action order,
+  so results are bit-identical to serial (enforced by a unit test and
+  the golden baseline). Measured on M1 (4 P-cores + 4 E-cores):
+  - Auto = one worker per P-core: wide spot ~4k -> ~7-8k iters/s.
+  - More threads than P-cores is COUNTERPRODUCTIVE (E-cores run the
+    jobs 3-5x slower and straggle at every join; 8 threads ~1k).
+  - What made it work: `QOS_CLASS_USER_INTERACTIVE` on workers
+    (keeps them on P-cores), always-spinning workers (cv wake costs
+    more than a job), lock-free queue-empty check (no mutex
+    contention while spinning), and gating fan-out to subtrees with
+    >= ~30-60us of work (finer fan-out loses to fork-join overhead;
+    per-node bodies are only 1-2us).
+  - Remaining limit: tree-granular fan-out leaves the aggregation and
+    the sequential alternating half-steps serial. Next lever is the
+    level-synchronous (bottom-up by depth) restructure — process all
+    nodes of a depth level in parallel across nodes and combos (the
+    GPU-CFR layout in docs/solver-algorithms.md); it also unlocks
+    SIMD over the per-combo loops.
 
 First goal: **parity with postflop-solver as a range-based postflop
 solver**. Research in docs/solver-algorithms.md concluded. Status: the

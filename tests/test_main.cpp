@@ -1002,4 +1002,26 @@ TEST(RiverSolverZeroSumInvariant) {
   CHECK(s2.stats().expl < s1.stats().expl);
 }
 
+TEST(RiverSolverParallelMatchesSerial) {
+  // The fork-join passRec must aggregate in fixed action order, so the
+  // parallel result is bit-identical to the serial one (not just close).
+  auto spot = riverSpot("7h8h9c2c2s", 300, 1500, "22+,A9s+,KTs+,QJs,JTs,T9s",
+                        "22+,A9s+,KTs+,QJs,JTs,T9s,AQo+");
+  pf::BetConfig cfg;
+  cfg.betFracs = {0.25, 0.5, 0.75, 1.25};
+  cfg.raiseMults = {2.5, 3.0};
+  pf::RiverSolver ser(spot, cfg);
+  ser.solve(50, "dcfr", 1);
+  for (int threads : {2, 4, 8}) {
+    pf::RiverSolver par(spot, cfg);
+    par.solve(50, "dcfr", threads);
+    CHECK(par.stats().ev0 == ser.stats().ev0);
+    CHECK(par.stats().ev1 == ser.stats().ev1);
+    CHECK(par.stats().expl == ser.stats().expl);
+    auto ps = par.rootStrategy(), ss = ser.rootStrategy();
+    CHECK(ps.size() == ss.size());
+    for (size_t i = 0; i < ps.size(); ++i) CHECK(ps[i] == ss[i]);
+  }
+}
+
 int main() { return runAllTests(); }

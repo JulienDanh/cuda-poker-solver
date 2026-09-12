@@ -1,13 +1,26 @@
+#ifdef __APPLE__
+#include <pthread.h>
+#include <sys/qos.h>
+#include <sys/sysctl.h>
+#endif
+
 #include "postflop_cfr.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cassert>
+#include <chrono>
 #include <cmath>
+#include <condition_variable>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <deque>
-#include <map>
 #include <functional>
+#include <map>
+#include <memory>
+#include <mutex>
+#include <thread>
 
 namespace pps {
 namespace pf {
@@ -26,7 +39,6 @@ int64_t roundTo(double x) { return static_cast<int64_t>(std::llround(x)); }
 
 RiverSolver::RiverSolver(const Spot& spot, const BetConfig& cfg)
     : spot_(spot), cfg_(cfg) {
-  initScratch();
   for (int p = 0; p < 2; ++p) {
     const Range& r = p == 0 ? spot_.oop : spot_.ip;
     Side& s = sides_[p];
@@ -208,6 +220,7 @@ int RiverSolver::buildNode(int64_t sc0, int64_t sc1, int actor, bool afterAllin,
   Node& nd = nodes_[idx];
   nd.sc[0] = sc0;
   nd.sc[1] = sc1;
+  maxDepth_ = std::max(maxDepth_, depth);
 
   // Terminal when betting is complete (equal non-zero contributions).
   if (sc0 == sc1 && sc0 > 0) {
@@ -226,6 +239,7 @@ int RiverSolver::buildNode(int64_t sc0, int64_t sc1, int actor, bool afterAllin,
   }
   nd.kind = Node::DECIDE;
   nd.player = actor;
+  maxNa_ = std::max(maxNa_, static_cast<int>(acts.size()));
   int n = sides_[actor].n;
   nd.regret.assign(acts.size() * n, 0.0);
   nd.stratSum.assign(acts.size() * n, 0.0);
@@ -296,6 +310,18 @@ void RiverSolver::buildTree() {
   // River start: OOP (player 0) acts first.
   buildNode(0, 0, 0, false, 0);
   numNodes_ = static_cast<int>(nodes_.size());
+  computeSubNodes();
+}
+
+void RiverSolver::computeSubNodes() {
+  subNodes_.assign(numNodes_, 0);
+  // Iterative post-order: children are always built after their parent, so
+  // accumulating in reverse node order visits every node after its subtree.
+  for (int i = numNodes_ - 1; i >= 0; --i) {
+    int cnt = 1;
+    for (int ch : nodes_[i].children) cnt += subNodes_[ch];
+    subNodes_[i] = cnt;
+  }
 }
 
 
@@ -412,13 +438,154 @@ void RiverSolver::avgStrategy(const Node& nd, int n, double* sigma) const {
 // Showdown sweep.
 // ---------------------------------------------------------------------------
 
-void RiverSolver::initScratch() {
-  for (int k = 0; k < 4; ++k) {
-    for (int d = 0; d < kMaxDepth; ++d) {
-      scratch_[k][d].assign(kScratchStride, 0.0);
+// ---------------------------------------------------------------------------
+// Fork-join task pool for passRec (parallel CFR).
+//
+// Only the passRec fan-out uses this: a DECIDE node with enough subtree work
+// submits its per-action child evaluations as jobs and waits for the group.
+// Waiting threads help run queued jobs (work-sharing), so the task tree makes
+// progress as long as any job is runnable. Jobs carry their own PassCtx
+// checked out of a freelist at submit time; a spawner that cannot check a
+// context out runs that child serially with its own context, so exhaustion
+// degrades to less parallelism, never to a deadlock.
+//
+// Determinism: children write disjoint cfv rows and disjoint nodes; the
+// spawner aggregates in fixed action order after the join, so the result is
+// bit-identical to the serial path regardless of scheduling.
+// ---------------------------------------------------------------------------
+
+class RiverSolver::ForkPool {
+ public:
+  ForkPool(int workers, int maxNa, int maxN, int depths, int freeCtxs) {
+    for (int i = 0; i < freeCtxs; ++i) {
+      freeCtxs_.push_back(std::make_unique<PassCtx>());
+      freeCtxs_.back()->init(maxNa, maxN, depths);
+    }
+    for (int i = 0; i < workers; ++i) {
+      threads_.emplace_back([this] { workerLoop(); });
     }
   }
-}
+
+  ~ForkPool() {
+    {
+      std::lock_guard<std::mutex> lk(m_);
+      stop_ = true;
+    }
+    cv_.notify_all();
+    for (auto& t : threads_) t.join();
+  }
+
+  ForkPool(const ForkPool&) = delete;
+  ForkPool& operator=(const ForkPool&) = delete;
+
+  // Returns null when all free contexts are checked out.
+  PassCtx* tryCheckout() {
+    std::lock_guard<std::mutex> lk(m_);
+    if (freeCtxs_.empty()) return nullptr;
+    PassCtx* c = freeCtxs_.back().release();
+    freeCtxs_.pop_back();
+    return c;
+  }
+
+  void submit(std::atomic<int>& group, PassCtx* ctx,
+              std::function<void()> fn) {
+    group.fetch_add(1, std::memory_order_relaxed);
+    {
+      std::lock_guard<std::mutex> lk(m_);
+      queue_.push_back(Job{std::move(fn), &group, ctx});
+      qsize_.fetch_add(1, std::memory_order_release);
+    }
+    cv_.notify_one();
+  }
+
+  // Helps run queued jobs until `group` reaches zero.
+  void wait(std::atomic<int>& group) {
+    debugSites_.fetch_add(1, std::memory_order_relaxed);
+    while (group.load(std::memory_order_acquire) > 0) {
+      Job j = popJob();
+      if (j.fn) {
+        runJob(j);
+      } else {
+        // Children still in flight; spin on the queue/group counters.
+        spin();
+      }
+    }
+  }
+
+  long debugJobs() const { return debugJobs_.load(); }
+  long debugSites() const { return debugSites_.load(); }
+
+ private:
+  struct Job {
+    std::function<void()> fn;
+    std::atomic<int>* group;
+    PassCtx* ctx;  // null when the job shares no free-list context
+  };
+
+  static void spin() {
+    for (volatile int i = 0; i < 100; ++i) {
+    }
+  }
+
+  Job popJob() {
+    // Fast path: take the lock only when the queue looks non-empty, so
+    // idle spinners never contend the mutex.
+    if (qsize_.load(std::memory_order_acquire) == 0) return Job{};
+    std::lock_guard<std::mutex> lk(m_);
+    if (queue_.empty()) return Job{};
+    Job j = std::move(queue_.front());
+    queue_.pop_front();
+    qsize_.fetch_sub(1, std::memory_order_release);
+    return j;
+  }
+
+  void runJob(Job& j) {
+    debugJobs_.fetch_add(1, std::memory_order_relaxed);
+    j.fn();
+    if (j.ctx) checkin(j.ctx);
+    j.group->fetch_sub(1, std::memory_order_acq_rel);
+  }
+
+  void checkin(PassCtx* c) {
+    std::unique_ptr<PassCtx> p(c);
+    std::lock_guard<std::mutex> lk(m_);
+    freeCtxs_.push_back(std::move(p));
+  }
+
+  void workerLoop() {
+#ifdef __APPLE__
+    // Keep workers on performance cores: on Apple Silicon, threads without
+    // an interactive QoS get parked on efficiency cores, which run these
+    // microsecond-scale jobs 3-5x slower and straggle at every join.
+    pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+#endif
+    // Jobs are microsecond-scale, so spin-poll the atomic queue counter for
+    // a while before sleeping on the condition variable: a cv wake costs
+    // more than most jobs.
+    for (;;) {
+      for (;;) {
+        Job j = popJob();
+        if (!j.fn) break;
+        runJob(j);
+      }
+      if (stop_.load(std::memory_order_relaxed)) return;
+      // Spin while idle: the solver submits job waves every few dozen
+      // microseconds; a condition-variable wake costs more than that.
+      // (Workers only spin while solve() is running; the pool dies with it.)
+      spin();
+    }
+  }
+
+  std::vector<std::unique_ptr<PassCtx>> freeCtxs_;
+  std::vector<std::thread> threads_;
+  std::deque<Job> queue_;
+  std::mutex m_;
+  std::condition_variable cv_;
+  std::atomic<size_t> qsize_{0};
+  std::atomic<bool> stop_{false};
+  std::atomic<long> debugJobs_{0};
+  std::atomic<long> debugSites_{0};
+};
 
 void RiverSolver::showdownValues(int nodeIdx, int tr, const double* reachOpp,
                                  double winV, double tieV, double loseV,
@@ -517,8 +684,38 @@ void RiverSolver::disjointMass(int tr, const double* reachOpp,
 // CFR pass (alternating half-step for the traverser).
 // ---------------------------------------------------------------------------
 
+namespace {
+// A DECIDE node fans out its per-action child evaluations as parallel jobs
+// when the subtree work (nodes x combos) is large enough to amortize the
+// fork-join overhead (jobs must be tens of microseconds). Tuned against
+// tools/quality/bench_river.sh.
+constexpr long kSpawnWork = 8192;
+// Fan-out cap: with very large action lists the per-node bookkeeping would
+// dominate; keep such nodes serial.
+constexpr int kMaxSpawnFan = 16;
+// Auto mode skips the pool below this estimated per-iteration work.
+constexpr long kAutoParallelWork = 8192;
+
+// On Apple Silicon only the performance cores pay off for these
+// microsecond-scale fork-join jobs; efficiency cores run them 3-5x slower
+// and straggle at every join. Default to the P-core count when detectable.
+int detectComputeCores() {
+#ifdef __APPLE__
+  int n = 0;
+  size_t sz = sizeof(n);
+  if (sysctlbyname("hw.perflevel0.logicalcpu", &n, &sz, nullptr, 0) == 0 &&
+      n > 0) {
+    return n;
+  }
+#endif
+  int hw = static_cast<int>(std::thread::hardware_concurrency());
+  return hw > 0 ? hw : 1;
+}
+}  // namespace
+
 void RiverSolver::passRec(int nodeIdx, int tr, const double* reachOpp,
-                          const Discount& d, double* outVal, int depth) {
+                          const Discount& d, double* outVal, ForkPool* pool,
+                          PassCtx& ctx, int depth) {
   Node& nd = nodes_[nodeIdx];
   int ntr = sides_[tr].n;
   if (nd.kind == Node::SHOWDOWN) {
@@ -539,21 +736,68 @@ void RiverSolver::passRec(int nodeIdx, int tr, const double* reachOpp,
     return;
   }
 
+  assert(depth + 1 < ctx.depths);
   int n = sides_[nd.player].n;
   int na = static_cast<int>(nd.actions.size());
-  double* sigma = scratch_[0][depth].data();
+  double* sigma = ctx.sigma(depth);
   regretMatching(nd, n, sigma);
-  if (nd.player == tr) {
-    double* cfv = scratch_[1][depth].data();
+
+  bool oppNode = nd.player != tr;
+  double* aval = ctx.aval(depth);  // per-action child values (na rows of ntr)
+  double* reachRows = ctx.reach(depth);
+
+  // Per-action reach into each child. At the traverser's own nodes all
+  // children see the same reach; at opponent nodes each action reweights.
+  if (oppNode) {
     for (int a = 0; a < na; ++a) {
-      passRec(nd.children[a], tr, reachOpp, d, cfv + static_cast<size_t>(a) * ntr,
-              depth + 1);
+      for (int c = 0; c < n; ++c) {
+        reachRows[static_cast<size_t>(a) * n + c] =
+            reachOpp[c] * sigma[static_cast<size_t>(a) * n + c];
+      }
     }
+  }
+
+  // Fan-out: submit per-action child evaluations as jobs. Each job runs on
+  // its own pool context; actions without a free context run serially here
+  // (same values, fewer threads).
+  std::atomic<int> group(0);
+  int nSpawned = 0;
+  bool jobDone[kMaxSpawnFan] = {false};
+  if (pool != nullptr && na >= 2 && na <= kMaxSpawnFan &&
+      static_cast<long>(subNodes_[nodeIdx]) * (sides_[0].n + sides_[1].n) >=
+          kSpawnWork) {
+    for (int a = 0; a < na; ++a) {
+      PassCtx* jc = pool->tryCheckout();
+      if (jc == nullptr) break;
+      const double* ra = oppNode ? reachRows + static_cast<size_t>(a) * n
+                                : reachOpp;
+      double* dst = aval + static_cast<size_t>(a) * ntr;
+      pool->submit(group, jc, [this, nodeIdx, tr, ra, &d, dst, pool, jc, depth,
+                              a] {
+        passRec(nodes_[nodeIdx].children[a], tr, ra, d, dst, pool, *jc,
+                depth + 1);
+      });
+      jobDone[a] = true;
+      ++nSpawned;
+    }
+  }
+
+  for (int a = 0; a < na; ++a) {
+    if (jobDone[a]) continue;
+    const double* ra = oppNode ? reachRows + static_cast<size_t>(a) * n
+                               : reachOpp;
+    double* dst = aval + static_cast<size_t>(a) * ntr;
+    passRec(nd.children[a], tr, ra, d, dst, pool, ctx, depth + 1);
+  }
+  if (nSpawned > 0) pool->wait(group);
+
+  // Aggregate in fixed action order: bit-identical to the serial path.
+  if (!oppNode) {
     for (int c = 0; c < ntr; ++c) {
       double v = 0.0;
       for (int a = 0; a < na; ++a) {
         v += sigma[static_cast<size_t>(a) * n + c] *
-             cfv[static_cast<size_t>(a) * ntr + c];
+             aval[static_cast<size_t>(a) * ntr + c];
       }
       outVal[c] = v;
     }
@@ -567,35 +811,86 @@ void RiverSolver::passRec(int nodeIdx, int tr, const double* reachOpp,
       for (int c = 0; c < n; ++c) {
         double& r = nd.regret[static_cast<size_t>(a) * n + c];
         double coef = r >= 0.0 ? d.posCoef : d.negCoef;
-        r = r * coef + (cfv[static_cast<size_t>(a) * ntr + c] -
-                        outVal[c]);
+        r = r * coef + (aval[static_cast<size_t>(a) * ntr + c] - outVal[c]);
       }
     }
   } else {
     // Opponent's node: the counterfactual value is the plain sum over
     // actions of the child cfvs; the opponent's strategy enters through
     // the updated cfreach, NOT through an extra marginal probability.
-    double* childReach = scratch_[2][depth].data();
-    double* cv = scratch_[3][depth].data();
-    for (int c = 0; c < ntr; ++c) outVal[c] = 0.0;
-    for (int a = 0; a < na; ++a) {
-      for (int c = 0; c < n; ++c) {
-        childReach[c] = reachOpp[c] * sigma[static_cast<size_t>(a) * n + c];
+    for (int c = 0; c < ntr; ++c) {
+      double v = 0.0;
+      for (int a = 0; a < na; ++a) {
+        v += aval[static_cast<size_t>(a) * ntr + c];
       }
-      passRec(nd.children[a], tr, childReach, d, cv, depth + 1);
-      for (int c = 0; c < ntr; ++c) outVal[c] += cv[c];
+      outVal[c] = v;
     }
   }
 }
 
-void RiverSolver::solve(int iterations, const std::string& algo) {
+void RiverSolver::solve(int iterations, const std::string& algo, int threads) {
   algo_ = algo;
+  int maxN = std::max(sides_[0].n, sides_[1].n);
+  int depths = std::min(PassCtx::kMaxDepth, maxDepth_ + 2);
+  PassCtx mainCtx;
+  mainCtx.init(maxNa_, maxN, depths);
+
+  std::unique_ptr<ForkPool> pool;
+  // threads: 0 = auto (one worker per performance core minus one; serial
+  // on tiny trees), 1 = serial, N >= 2 = N-1 workers. Workers raise their
+  // QoS to stay on P-cores and spin rather than sleep (waves arrive every
+  // few dozen microseconds), which is what makes fan-out profitable here.
+  if (threads != 1 && numNodes_ > 1) {
+    int workers = 0;
+    if (threads == 0) {
+      long work = static_cast<long>(numNodes_) * (sides_[0].n + sides_[1].n);
+      if (work >= kAutoParallelWork) {
+        workers = std::max(1, detectComputeCores() - 1);
+      }
+    } else {
+      workers = threads - 1;
+    }
+    if (workers > 0) {
+      pool = std::make_unique<ForkPool>(workers, maxNa_, maxN, depths,
+                                        4 * workers);
+    }
+    if (std::getenv("PFSOLVER_DEBUG")) {
+      std::fprintf(stderr,
+                   "pool workers=%d nodes=%d n0=%d n1=%d maxNa=%d maxDepth=%d\n",
+                   workers, numNodes_, sides_[0].n, sides_[1].n, maxNa_,
+                   maxDepth_);
+    }
+  }
+
   std::vector<double> rootVal0(sides_[0].n), rootVal1(sides_[1].n);
+  double dbgHalf = 0.0;
+  int dbgN = 0;
   for (int t = 0; t < iterations; ++t) {
     Discount d = makeDiscount(t, iterations);
-    passRec(0, 0, sides_[1].w.data(), d, rootVal0.data(), 0);
-    passRec(0, 1, sides_[0].w.data(), d, rootVal1.data(), 0);
+    if (std::getenv("PFSOLVER_DEBUG")) {
+      auto t0 = std::chrono::steady_clock::now();
+      passRec(0, 0, sides_[1].w.data(), d, rootVal0.data(), pool.get(),
+              mainCtx, 0);
+      passRec(0, 1, sides_[0].w.data(), d, rootVal1.data(), pool.get(),
+              mainCtx, 0);
+      dbgHalf += std::chrono::duration<double>(
+                     std::chrono::steady_clock::now() - t0)
+                     .count();
+      ++dbgN;
+      continue;
+    }
+    passRec(0, 0, sides_[1].w.data(), d, rootVal0.data(), pool.get(), mainCtx,
+            0);
+    passRec(0, 1, sides_[0].w.data(), d, rootVal1.data(), pool.get(), mainCtx,
+            0);
   }
+  if (dbgN > 0) {
+    std::fprintf(stderr, "half-step avg %.1fus jobs/half=%.1f sites/half=%.1f\n",
+                 dbgHalf / dbgN * 1e6,
+                 pool ? pool->debugJobs() / static_cast<double>(dbgN) : 0.0,
+                 pool ? pool->debugSites() / static_cast<double>(dbgN) : 0.0);
+  }
+  pool.reset();  // join workers before the serial final walks
   computeStats();
 }
 

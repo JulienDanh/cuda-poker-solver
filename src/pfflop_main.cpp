@@ -91,6 +91,7 @@ int main(int argc, char** argv) {
   std::string algo = "dcfr";
   bool dumpTree = false;
   bool rootStrat = false;
+  int threads = 0;
   for (int i = 10; i < argc; ++i) {
     if (std::strcmp(argv[i], "--algo") == 0 && i + 1 < argc) {
       algo = argv[++i];
@@ -98,6 +99,8 @@ int main(int argc, char** argv) {
       dumpTree = true;
     } else if (std::strcmp(argv[i], "--root") == 0) {
       rootStrat = true;
+    } else if (std::strcmp(argv[i], "--threads") == 0 && i + 1 < argc) {
+      threads = std::stoi(argv[++i]);
     }
   }
 
@@ -105,7 +108,7 @@ int main(int argc, char** argv) {
   if (dumpTree) {
     solver.dumpTree(stdout);
   }
-  solver.solve(iters, algo);
+  solver.solve(iters, algo, threads);
   if (rootStrat) {
     auto rs = solver.rootStrategy();
     std::printf("ROOTSTRAT");
