@@ -6,19 +6,27 @@
 
 namespace pps {
 
-const uint8_t kComboCards[kCombos][2] = [] {
-  // Cards use our encoding: suit * 13 + rank.
-  static uint8_t table[kCombos][2];
-  int idx = 0;
-  for (int a = 0; a < 52; ++a) {
-    for (int b = a + 1; b < 52; ++b) {
-      table[idx][0] = static_cast<uint8_t>(a);
-      table[idx][1] = static_cast<uint8_t>(b);
-      ++idx;
+namespace {
+struct ComboTable {
+  uint8_t c[kCombos][2];
+  ComboTable() {
+    int idx = 0;
+    for (int a = 0; a < 52; ++a) {
+      for (int b = a + 1; b < 52; ++b) {
+        c[idx][0] = static_cast<uint8_t>(a);
+        c[idx][1] = static_cast<uint8_t>(b);
+        ++idx;
+      }
     }
   }
-  return table;
-}();
+};
+const ComboTable kTable;
+}  // namespace
+
+void comboCards(int i, uint8_t& a, uint8_t& b) {
+  a = kTable.c[i][0];
+  b = kTable.c[i][1];
+}
 
 int comboIndex(uint8_t a, uint8_t b) {
   if (a > b) std::swap(a, b);
@@ -61,8 +69,10 @@ void Range::normalize() {
 
 void Range::filterBoard(const Card* board, int n) {
   for (int i = 0; i < kCombos; ++i) {
+    uint8_t ca, cb;
+    comboCards(i, ca, cb);
     for (int b = 0; b < n; ++b) {
-      if (kComboCards[i][0] == board[b] || kComboCards[i][1] == board[b]) {
+      if (ca == board[b] || cb == board[b]) {
         w[i] = 0.0;
         break;
       }
@@ -105,6 +115,11 @@ void addCombo(Range& r, int a, int b, double weight) {
 
 // Adds all combos of the class (hi, lo, kind).
 void addClassCombos(Range& r, int hi, int lo, char kind, double weight) {
+  if (kind == 'a') {
+    addClassCombos(r, hi, lo, 's', weight);
+    addClassCombos(r, hi, lo, 'o', weight);
+    return;
+  }
   if (kind == 'p') {
     for (int s1 = 0; s1 < 4; ++s1) {
       for (int s2 = s1 + 1; s2 < 4; ++s2) {
@@ -128,7 +143,6 @@ void addClassCombos(Range& r, int hi, int lo, char kind, double weight) {
 ClassRef parseClass(const std::string& tok) {
   // Accepted: "TT", "AKs", "AKo" (optionally with ":w" already stripped).
   ClassRef c;
-  size_t pos = 0;
   std::string t = tok;
   double weight = 1.0;
   size_t colon = t.find(':');
@@ -142,7 +156,8 @@ ClassRef parseClass(const std::string& tok) {
   int r2 = rankFromChar(t[1]);
   if (t.size() == 2) {
     if (r1 < 0 || r2 < 0) throw std::runtime_error("bad range token: " + tok);
-    c.suitKind = (r1 == r2) ? 'p' : 'o';
+    // Bare "AK" (no s/o suffix) means all combos, like postflop-solver.
+    c.suitKind = (r1 == r2) ? 'p' : 'a';
     c.hi = std::max(r1, r2);
     c.lo = std::min(r1, r2);
     return c;

@@ -7,6 +7,8 @@
 
 #include "cards.h"
 #include "eval.h"
+#include "postflop_cfr.h"
+#include "range.h"
 #include "framework.h"
 #include "hand169.h"
 #include "icm.h"
@@ -901,6 +903,103 @@ TEST(HuChipEvExploitabilityConverges) {
   CHECK(longRun.exploitability / cfg.bb < 6.0);
   CHECK(longRun.exploitability < 0.65 * shortRun.exploitability);
   CHECK(longRun.sem / cfg.bb < 0.5);
+}
+
+// -------------------------------------------- range-based river solver ---
+
+TEST(RangeParser) {
+  auto total = [](const std::string& s) {
+    Range r = parseRange(s);
+    return r.total();
+  };
+  CHECK_NEAR(total("AA"), 6.0, 1e-9);
+  CHECK_NEAR(total("AKs"), 4.0, 1e-9);
+  CHECK_NEAR(total("AKo"), 12.0, 1e-9);
+  CHECK_NEAR(total("AK"), 16.0, 1e-9);  // both suited and offsuit
+  CHECK_NEAR(total("TT+"), 5 * 6, 1e-9);
+  CHECK_NEAR(total("A9s+"), 5 * 4, 1e-9);  // A9s..AKs
+  CHECK_NEAR(total("T9s+"), 5 * 4, 1e-9);  // T9s, JTs, QJs, KQs, AKs
+  CHECK_NEAR(total("A5s-A2s"), 4 * 4, 1e-9);
+  CHECK_NEAR(total("98s-65s"), 4 * 4, 1e-9);
+  CHECK_NEAR(total("55-22"), 4 * 6, 1e-9);
+  CHECK_NEAR(total("AA:0.5,KK"), 6 * 0.5 + 6, 1e-9);
+  CHECK_NEAR(total("AK,AA"), 16 + 6, 1e-9);
+}
+
+namespace {
+pf::Spot riverSpot(const std::string& bd, int64_t pot, int64_t stack,
+                   const std::string& oop, const std::string& ip) {
+  pf::Spot s;
+  for (int i = 0; i < 5; ++i) {
+    char r = bd[2 * i], su = bd[2 * i + 1];
+    int rank = r == 'A'   ? 12
+               : r == 'K' ? 11
+               : r == 'Q' ? 10
+               : r == 'J' ? 9
+               : r == 'T' ? 8
+                          : r - '2';
+    int suit = su == 'c' ? 0 : su == 'd' ? 1 : su == 'h' ? 2 : 3;
+    s.board[i] = static_cast<Card>(suit * 13 + rank);
+  }
+  s.oop = parseRange(oop);
+  s.ip = parseRange(ip);
+  s.pot = pot;
+  s.stack = stack;
+  return s;
+}
+}  // namespace
+
+TEST(RiverSolverTieBoard) {
+  // Royal flush on board: every line ties, so the unique equilibrium is
+  // EV pot/2 each with zero exploitability.
+  auto spot = riverSpot("AsKsQsJsTs", 1000, 500, "AA,KK,QQ", "AK,AQ,KQ");
+  pf::BetConfig cfg;
+  cfg.betFracs = {0.5, 0.75, 1.0};
+  cfg.raiseMults = {2.5, 3.0};
+  pf::RiverSolver s(spot, cfg);
+  s.solve(50, "dcfr");
+  auto st = s.stats();
+  CHECK_NEAR(st.ev0, 500.0, 1e-6);
+  CHECK_NEAR(st.ev1, 500.0, 1e-6);
+  CHECK(st.expl < 1e-6);
+}
+
+TEST(RiverSolverUniformHandValues) {
+  // On the tie board with all-in-only sizing, uniform (iteration-0)
+  // strategies give hand-derivable values: with every decision at 1/2,
+  // EV0 = 562.5 and EV1 = 437.5. This pins the value-walk units, the
+  // fold-terminal reach weighting and the pair-mass normalization.
+  auto spot = riverSpot("AsKsQsJsTs", 1000, 500, "AA,KK,QQ", "AK,AQ,KQ");
+  pf::BetConfig cfg;
+  cfg.betFracs = {0.5, 0.75, 1.0};
+  cfg.raiseMults = {2.5, 3.0};
+  pf::RiverSolver s(spot, cfg);
+  s.solve(0, "dcfr");
+  auto st = s.stats();
+  CHECK_NEAR(st.ev0, 562.5, 1e-6);
+  CHECK_NEAR(st.ev1, 437.5, 1e-6);
+}
+
+TEST(RiverSolverZeroSumInvariant) {
+  auto spot = riverSpot("Qs9h2d7c8d", 1000, 500, "22+,A9s+,KTs+,QJs,JTs,T9s",
+                        "22+,A9s+,KTs+,QJs,JTs,T9s,AQo+");
+  pf::BetConfig cfg;
+  cfg.betFracs = {0.5, 0.75, 1.0};
+  cfg.raiseMults = {2.5, 3.0};
+  for (int it : {0, 1, 3, 20, 100}) {
+    pf::RiverSolver s(spot, cfg);
+    s.solve(it, "dcfr");
+    auto st = s.stats();
+    CHECK_NEAR(st.ev0 + st.ev1, 1000.0, 1e-6);
+    CHECK(st.expl >= -1e-6);
+  }
+  // Exploitability decreases with iterations (roughly O(1/sqrt(T)) or
+  // better with discounting).
+  pf::RiverSolver s1(spot, cfg);
+  s1.solve(30, "dcfr");
+  pf::RiverSolver s2(spot, cfg);
+  s2.solve(300, "dcfr");
+  CHECK(s2.stats().expl < s1.stats().expl);
 }
 
 int main() { return runAllTests(); }

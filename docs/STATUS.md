@@ -133,7 +133,17 @@ Last updated: after commit aab9688 (multi-street play).
 ## 3. Recommended next steps
 
 First goal: **parity with postflop-solver as a range-based postflop
-solver**. Research in docs/solver-algorithms.md concluded:
+solver**. Research in docs/solver-algorithms.md concluded. Status: the
+river milestone is DONE — src/postflop_cfr.{h,cpp} (pfflop CLI) solves
+river spots with vanilla DCFR using the oracle's exact discounting, and
+matches postflop-solver's EVs to ~1e-4 chips and exploitability along
+the whole iteration trajectory (make river-parity). Two algorithms are
+implemented: parity DCFR and HS-DCFR(30), the 2026 state of the art
+(HS is 2-4x faster early; parity DCFR with its power-of-4 average reset
+polishes tighter at 1000+ iterations). Remaining for full parity:
+turn and flop chances (the tree/chance machinery is designed for it),
+16-bit compression, suit isomorphism, and the performance engineering
+(SIMD/flat arrays). Next: 
 
 1. Build the range-based postflop engine with vanilla **DCFR** using
    postflop-solver's exact update rules (alternating updates, RM+,

@@ -7,19 +7,23 @@ LDFLAGS ?=
 THREADFLAGS := -pthread
 
 SRCS := src/cards.cpp src/common.cpp src/eval.cpp src/fgs.cpp src/hand169.cpp \
-        src/icm.cpp src/poker.cpp src/showdown.cpp
+        src/icm.cpp src/poker.cpp src/showdown.cpp src/range.cpp \
+        src/postflop_cfr.cpp
 HEADERS := $(wildcard src/*.h)
 BUILD := build
 
-.PHONY: all test verify-pfs stub-bias clean
+.PHONY: all test verify-pfs stub-bias river-parity clean
 
-all: $(BUILD)/ppsolve
+all: $(BUILD)/ppsolve $(BUILD)/pfflop
 
 $(BUILD):
 	mkdir -p $(BUILD)
 
 $(BUILD)/ppsolve: $(SRCS) src/main.cpp $(HEADERS) | $(BUILD)
 	$(CXX) $(CXXFLAGS) $(THREADFLAGS) -Isrc -o $@ $(SRCS) src/main.cpp $(LDFLAGS)
+
+$(BUILD)/pfflop: $(SRCS) src/pfflop_main.cpp $(HEADERS) | $(BUILD)
+	$(CXX) $(CXXFLAGS) $(THREADFLAGS) -Isrc -o $@ $(SRCS) src/pfflop_main.cpp $(LDFLAGS)
 
 $(BUILD)/tests: $(SRCS) tests/test_main.cpp tests/framework.h | $(BUILD)
 	$(CXX) $(CXXFLAGS) $(THREADFLAGS) -Isrc -Itests -o $@ $(SRCS) tests/test_main.cpp $(LDFLAGS)
@@ -39,6 +43,11 @@ verify-pfs: $(BUILD)/verify_eval7
 # solve (see tools/pfs-verify/stub_bias.sh).
 stub-bias:
 	tools/pfs-verify/stub_bias.sh
+
+# Head-to-head parity of the range-based river solver against
+# b-inary/postflop-solver (requires cargo).
+river-parity:
+	tools/pfs-verify/check_river_parity.sh
 
 clean:
 	rm -rf $(BUILD)

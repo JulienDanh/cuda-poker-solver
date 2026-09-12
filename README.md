@@ -274,6 +274,11 @@ with an all-in collapse threshold at 50% of the effective stack.
 - [x] ICM payoffs (Harville subset DP, brute-force-tested)
 - [x] Evaluator cross-validated against postflop-solver (found and fixed
   a double-trips full-house bug; 8M hands, zero violations)
+- [x] Range-based river solver at parity with postflop-solver: identical
+  bet trees, vanilla DCFR with the oracle's exact discounting, EVs match
+  to ~1e-4 of the pot and exploitability matches along the whole
+  iteration trajectory; HS-DCFR(30) (2026 SOTA) also implemented
+  (src/postflop_cfr.*, build/pfflop, make river-parity)
 - [x] 8-max preflop state machine (blinds, antes, min-raises, side pots)
 - [x] FGS continuation interface + showdown stub
 - [x] CLI + CSV strategy dump

@@ -13,9 +13,9 @@ namespace pps {
 
 constexpr int kCombos = 1326;
 
-// Combo i is the pair (comboCards[i][0], comboCards[i][1]) with
-// cards in ascending index order.
-extern const uint8_t kComboCards[kCombos][2];
+// Combo i is the pair of card indices (a < b); combos are enumerated in
+// ascending order (a, b).
+void comboCards(int i, uint8_t& a, uint8_t& b);
 
 // Index of the combo {a, b} (a != b), order-independent.
 int comboIndex(uint8_t a, uint8_t b);
