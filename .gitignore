@@ -1,0 +1,23 @@
+# Build artifacts
+*.o
+*.so
+*.exe
+bin/
+build/
+out/
+
+# CUDA
+*.cubin
+*.ptx
+*.fatbin
+ncu-profiles/
+
+# Python tooling (if used for tooling/benchmarks)
+__pycache__/
+*.pyc
+.venv/
+
+# IDE / OS
+.idea/
+.vscode/
+.DS_Store
