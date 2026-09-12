@@ -71,7 +71,7 @@ src/
 cuda/
 └── poker_kernels.cu  batched ICM + board sampling kernels (optional)
 tests/
-└── test_main.cpp     23 unit tests
+└── test_main.cpp     20 unit tests
 ```
 
 ### The MCCFR engine
