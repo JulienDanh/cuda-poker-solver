@@ -6,7 +6,7 @@ CXXFLAGS ?= -std=c++17 -O2 -Wall -Wextra -Wno-unused-parameter
 LDFLAGS ?=
 THREADFLAGS := -pthread
 
-SRCS := src/cards.cpp src/common.cpp src/fgs.cpp src/hand169.cpp \
+SRCS := src/cards.cpp src/common.cpp src/eval.cpp src/fgs.cpp src/hand169.cpp \
         src/icm.cpp src/poker.cpp src/showdown.cpp
 HEADERS := $(wildcard src/*.h)
 BUILD := build

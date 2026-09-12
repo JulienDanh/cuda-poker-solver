@@ -54,6 +54,14 @@ class PokerGame {
     int numBuckets = 169;  // 169 (exact hands) or 15 (coarse)
     BetAbstraction bets;
     ContinuationModel* continuation = nullptr;  // FGS model (owned by caller)
+    // Payoff model: true = ICM equity deltas (tournament), false = chip
+    // deltas (chip-EV). Chip-EV is the correctness-validation mode: the
+    // game is exactly zero-sum in chips and no ICM approximation is in
+    // play.
+    bool icm = true;
+    // Boards sampled per continuation (FGS stub) resolution. More boards
+    // = less per-history noise in the stub's outcome distribution.
+    int continuationSamples = 16;
   };
 
   struct Action {
@@ -108,6 +116,7 @@ class PokerGame {
   std::string positionName(int seat) const;
   int smallBlindSeat() const { return cfg_.numPlayers == 2 ? 0 : 1; }
   int bigBlindSeat() const { return cfg_.numPlayers == 2 ? 1 : 2; }
+  int64_t startStackOf(int seat) const { return startStacks_[seat]; }
   const Config& config() const { return cfg_; }
 
   // Representative hole cards for a canonical hand index (used to build
@@ -117,6 +126,7 @@ class PokerGame {
  private:
   Config cfg_;
   std::vector<double> icm0_;          // start-of-hand ICM equity per seat
+  std::vector<int64_t> startStacks_;  // per-seat start-of-hand stacks
   uint64_t gameId_ = 0;               // separates ICM caches across instances
   void resolveFoldWin(State& s) const;
   void resolveShowdown(State& s) const;

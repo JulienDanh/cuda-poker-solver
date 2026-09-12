@@ -37,6 +37,10 @@ PokerGame::PokerGame(Config cfg) : cfg_(std::move(cfg)) {
   }
   std::vector<int64_t> stacks(cfg_.numPlayers, cfg_.startStack);
   if (!cfg_.stacks.empty()) stacks = cfg_.stacks;
+  startStacks_ = stacks;
+  if (!cfg_.icm) {
+    return;  // chip-EV mode: no payout table or baseline equity needed
+  }
   double paySum = 0.0;
   for (double p : cfg_.payouts) paySum += p;
   if (paySum <= 0.999 || paySum >= 1.001) {
@@ -348,7 +352,7 @@ void PokerGame::resolveContinuation(State& s) const {
     ctx.holeCards[i] = {s.hole[2 * i], s.hole[2 * i + 1]};
   }
   ctx.contributed.assign(s.contributed.begin(), s.contributed.begin() + s.numPlayers);
-  ctx.samples = 16;
+  ctx.samples = cfg_.continuationSamples;
   uint64_t seed = fnv1a(0xCBF29CE484222325ULL, s.hist.data(), s.nhist * 4);
   s.contOutcomes = cfg_.continuation->continuationEV(ctx, seed);
   s.terminalKind = 3;
@@ -384,10 +388,22 @@ double PokerGame::icmDelta(
 
 double PokerGame::payoff(const State& s, int player) const {
   if (s.terminalKind == 1 || s.terminalKind == 2) {
+    if (!cfg_.icm) return static_cast<double>(s.finalStack[player] - startStacks_[player]);
     std::vector<std::array<int64_t, kMaxPlayers>> fs(1, s.finalStack);
     return icmDelta(fs, {1.0}, player);
   }
   assert(s.terminalKind == 3);
+  if (!cfg_.icm) {
+    // Chip delta = chips won from the pot minus everything contributed
+    // (antes, blinds, bets). `stack` is the behind-stack, so the final
+    // stack is stack + winnings and the delta vs. start is
+    // winnings - contributed.
+    double v = -static_cast<double>(s.contributed[player]);
+    for (const auto& o : s.contOutcomes) {
+      v += o.probability * static_cast<double>(o.winnings[player]);
+    }
+    return v;
+  }
   std::vector<std::array<int64_t, kMaxPlayers>> fs;
   std::vector<double> probs;
   fs.reserve(s.contOutcomes.size());

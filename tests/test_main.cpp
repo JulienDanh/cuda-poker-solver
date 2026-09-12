@@ -6,6 +6,7 @@
 #include <map>
 
 #include "cards.h"
+#include "eval.h"
 #include "framework.h"
 #include "hand169.h"
 #include "icm.h"
@@ -318,7 +319,6 @@ TEST(KuhnHarnessSanity) {
   // pairs. Action codes: 0 = first listed action (check or fold),
   // 1 = second listed action (bet or call).
   KuhnGame game;
-  auto uniform = [](size_t n) { return std::vector<double>(n, 1.0 / n); };
 
   // Build "always action 0" and "always action 1" tables for a player.
   auto fixedTable = [&](int which) {
@@ -405,6 +405,14 @@ PokerGame::Config testConfig(int numPlayers, int64_t stack, int64_t ante,
   cfg.payouts = {0.5, 0.3, 0.2};
   cfg.numBuckets = 169;
   cfg.continuation = cont;
+  return cfg;
+}
+
+// Chip-EV variant: payoffs are chip deltas, no ICM.
+PokerGame::Config chipConfig(int numPlayers, int64_t stack, int64_t ante,
+                             ContinuationModel* cont) {
+  auto cfg = testConfig(numPlayers, stack, ante, cont);
+  cfg.icm = false;
   return cfg;
 }
 
@@ -581,6 +589,112 @@ TEST(PokerBustedPlayerExcluded) {
   CHECK(s.folded[0] == 1);
   // First to act is SB (seat 1) since BTN busted.
   CHECK(game.currentPlayer(s) == 1);
+}
+
+// ------------------------------------------------------- chip-EV mode ---
+
+TEST(ChipFoldWinZeroSum) {
+  ShowdownContinuation cont;
+  PokerGame game(chipConfig(2, 50000, 0, &cont));
+  RNG rng(8);
+  PokerGame::State s = dealtState(game, rng);
+  // SB folds; BB wins the pot of sb + bb.
+  s = game.apply(s, {PokerGame::Action::FOLD, 0});
+  CHECK(game.isTerminal(s));
+  CHECK_NEAR(game.payoff(s, 0), -500.0, 1e-9);
+  CHECK_NEAR(game.payoff(s, 1), 500.0, 1e-9);
+  CHECK_NEAR(game.payoff(s, 0) + game.payoff(s, 1), 0.0, 1e-9);
+}
+
+TEST(ChipShowdownZeroSum) {
+  ShowdownContinuation cont;
+  PokerGame game(chipConfig(2, 5000, 0, &cont));
+  RNG rng(9);
+  PokerGame::State s = dealtState(game, rng);
+  // SB shoves all-in, BB calls.
+  auto acts = game.legalActions(s);
+  const PokerGame::Action* shove = nullptr;
+  for (auto& a : acts) {
+    if (a.type == PokerGame::Action::RAISE && a.raiseTo == 5000) shove = &a;
+  }
+  s = game.apply(s, *shove);
+  acts = game.legalActions(s);
+  const PokerGame::Action* call = nullptr;
+  for (auto& a : acts) {
+    if (a.type == PokerGame::Action::MATCH) call = &a;
+  }
+  s = game.apply(s, *call);
+  CHECK(game.isChance(s));
+  PokerGame::State t = game.sampleChance(s, rng);
+  CHECK(game.isTerminal(t));
+  double p0 = game.payoff(t, 0);
+  double p1 = game.payoff(t, 1);
+  CHECK_NEAR(p0 + p1, 0.0, 1e-9);
+  // Winner takes the pot of 2*5000 minus... total pot = sb+bb+rest = 10000.
+  double winner = p0 > 0 ? p0 : p1;
+  CHECK_NEAR(winner, 10000.0 - 5000.0, 1e-9);  // net = +pot - own shove
+}
+
+TEST(ChipContinuationZeroSumAndMagnitude) {
+  ShowdownContinuation cont;
+  PokerGame game(chipConfig(2, 50000, 0, &cont));
+  RNG rng(21);
+  PokerGame::State s = dealtState(game, rng);
+  // SB raises 2.5bb, BB calls: continuation terminal, pot 2*2500.
+  auto acts = game.legalActions(s);
+  const PokerGame::Action* open = nullptr;
+  for (auto& a : acts) {
+    if (a.type == PokerGame::Action::RAISE && a.raiseTo == 2500) open = &a;
+  }
+  s = game.apply(s, *open);
+  acts = game.legalActions(s);
+  const PokerGame::Action* call = nullptr;
+  for (auto& a : acts) {
+    if (a.type == PokerGame::Action::MATCH) call = &a;
+  }
+  s = game.apply(s, *call);
+  CHECK(game.isTerminal(s));
+  CHECK(s.terminalKind == 3);
+  double p0 = game.payoff(s, 0);
+  double p1 = game.payoff(s, 1);
+  CHECK_NEAR(p0 + p1, 0.0, 1e-9);
+  // Each player contributed 2500; whoever wins the 5000 pot nets +2500
+  // under the showdown stub. Expected values must lie in [-2500, +2500].
+  CHECK(p0 >= -2500.0 - 1e-9 && p0 <= 2500.0 + 1e-9);
+}
+
+// Exploitability convergence: on the real heads-up poker game (chip-EV,
+// full bet abstraction), the engine must approach equilibrium as
+// iterations grow. ES-MCCFR converges as O(1/sqrt(T)), so 4x the
+// iterations must cut the exploitability bound substantially.
+TEST(HuChipEvExploitabilityConverges) {
+  ShowdownContinuation cont;
+  PokerGame::Config cfg = chipConfig(2, 50000, 0, &cont);
+  cfg.numBuckets = 169;
+  PokerGame game(cfg);
+
+  auto solveAndMeasure = [&](uint64_t iters) {
+    MCCFRConfig mcfg;
+    mcfg.iterations = iters;
+    mcfg.threads = 1;
+    MCCFR<PokerGame> solver(game, mcfg);
+    solver.train();
+    auto avg = solver.averageStrategies();
+    auto ex = huExploitability(game, avg, 250, 128, 0xBEEF);
+    std::printf("  iters=%llu exploitability %.3f bb/hand (sem %.3f) "
+                "v_avg0 %.3f bb\n",
+                static_cast<unsigned long long>(iters),
+                ex.exploitability / cfg.bb, ex.sem / cfg.bb, ex.vAvg0 / cfg.bb);
+    return ex;
+  };
+
+  auto shortRun = solveAndMeasure(60000);
+  auto longRun = solveAndMeasure(240000);
+
+  CHECK(shortRun.exploitability / cfg.bb < 12.0);
+  CHECK(longRun.exploitability / cfg.bb < 6.0);
+  CHECK(longRun.exploitability < 0.65 * shortRun.exploitability);
+  CHECK(longRun.sem / cfg.bb < 0.5);
 }
 
 int main() { return runAllTests(); }

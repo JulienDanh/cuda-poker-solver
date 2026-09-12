@@ -4,6 +4,7 @@
 #include <functional>
 #include <string>
 
+#include "eval.h"
 #include "fgs.h"
 #include "hand169.h"
 #include "poker.h"
@@ -26,6 +27,13 @@ struct Args {
   int buckets = 169;
   std::string outCsv = "strategy.csv";
   long dumpNodes = 50000;
+  std::string openSizes = "2.2,2.5,3.0";
+  std::string raiseMult = "2.5,3.0";
+  int maxBets = 4;
+  int contSamples = 16;
+  bool chipEv = false;
+  int explDeals = 0;  // >0: measure HU exploitability after training
+  int explBoards = 4;
   bool printUtgOpen = true;
 };
 
@@ -52,11 +60,20 @@ Args parseArgs(int argc, char** argv) {
     else if (s == "--buckets") a.buckets = std::stoi(next());
     else if (s == "--out") a.outCsv = next();
     else if (s == "--dump-nodes") a.dumpNodes = std::stol(next());
+    else if (s == "--open-sizes") a.openSizes = next();
+    else if (s == "--raise-mult") a.raiseMult = next();
+    else if (s == "--max-bets") a.maxBets = std::stoi(next());
+    else if (s == "--cont-samples") a.contSamples = std::stoi(next());
+    else if (s == "--chip-ev") a.chipEv = true;
+    else if (s == "--exploitability") a.explDeals = std::stoi(next());
+    else if (s == "--expl-boards") a.explBoards = std::stoi(next());
     else if (s == "--help") {
       std::printf(
           "usage: ppsolve [--seats N] [--stack chips] [--stacks a,b,..] [--sb c] [--bb c]\n"
           "               [--ante c] [--payouts p,p,..] [--iters N] [--threads N]\n"
-          "               [--buckets 169|15] [--out strategy.csv]\n");
+          "               [--buckets 169|15] [--chip-ev] [--exploitability N]\n"
+          "               [--open-sizes a,b,c] [--raise-mult a,b] [--max-bets N]\n"
+          "               [--out strategy.csv]\n");
       std::exit(0);
     } else {
       std::fprintf(stderr, "unknown arg %s\n", s.c_str());
@@ -198,6 +215,13 @@ int main(int argc, char** argv) {
   cfg.payouts.clear();
   for (auto& tok : splitString(a.payouts, ',')) cfg.payouts.push_back(std::stod(tok));
   cfg.numBuckets = a.buckets;
+  cfg.icm = !a.chipEv;
+  cfg.bets.openSizes.clear();
+  for (auto& tok : splitString(a.openSizes, ',')) cfg.bets.openSizes.push_back(std::stod(tok));
+  cfg.bets.raiseMultipliers.clear();
+  for (auto& tok : splitString(a.raiseMult, ',')) cfg.bets.raiseMultipliers.push_back(std::stod(tok));
+  cfg.bets.maxBets = a.maxBets;
+  cfg.continuationSamples = a.contSamples;
 
   ShowdownContinuation cont;
   cfg.continuation = &cont;
@@ -220,6 +244,17 @@ int main(int argc, char** argv) {
 
   auto avg = solver.averageStrategies();
   std::printf("infosets visited: %zu\n", avg.size());
+  if (a.explDeals > 0) {
+    if (cfg.numPlayers != 2) {
+      std::fprintf(stderr,
+                    "exploitability is only implemented for heads-up\n");
+      return 1;
+    }
+    auto ex = huExploitability(game, avg, a.explDeals, a.explBoards, 0xABCD);
+    std::printf("exploitability (upper bound, both players): %.6f bb/hand "
+                "(sem %.6f)  [v_avg0 %.6f bb]\n",
+                ex.exploitability / cfg.bb, ex.sem / cfg.bb, ex.vAvg0 / cfg.bb);
+  }
   if (a.printUtgOpen) printUtgRange(game, cfg.numBuckets, avg);
   dumpStrategy(game, cfg.numBuckets, avg, a.outCsv, a.dumpNodes);
   return 0;

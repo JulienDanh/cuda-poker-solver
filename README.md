@@ -35,6 +35,11 @@ The CUDA kernels (`cuda/poker_kernels.cu`: batched ICM subset-DP and board
 sampling) compile only with an NVIDIA toolkit and are currently
 **unvalidated — there is no NVIDIA GPU on the development machine**.
 
+Two payoff modes: `--chip-ev` (default off) evaluates terminals as chip
+deltas — the correctness-validation mode (exactly zero-sum, no ICM
+approximation); the default ICM mode evaluates Malmuth-Harville equity
+deltas.
+
 ## Usage
 
 ```
@@ -48,7 +53,22 @@ Options: `--seats` (2..8), `--stack` (uniform chips), `--stacks a,b,...`
 `--payouts` (fractions summing to 1), `--iters`, `--threads`,
 `--buckets 169|15` (169 exact canonical hands, or a coarse 15-bucket
 abstraction), `--out` (CSV path), `--dump-nodes` (cap on the strategy
-dump enumeration; the full 8-max public tree is combinatorially large).
+dump enumeration; the full 8-max public tree is combinatorially large),
+`--chip-ev` (chip-delta payoffs), `--exploitability N` (heads-up only:
+measure the exploitability bound over N deals after training),
+`--open-sizes/--raise-mult/--max-bets` (bet abstraction), `--cont-samples`
+(boards per FGS stub resolution).
+
+Exploitability example (heads-up chip-EV, full abstraction):
+
+```
+./build/ppsolve --seats 2 --stack 50000 --sb 500 --bb 1000 --ante 0 \
+    --chip-ev --buckets 169 --iters 240000 --threads 1 \
+    --exploitability 200 --expl-boards 128 --dump-nodes 0 --out /dev/null
+```
+
+External-sampling MCCFR converges as O(1/sqrt(T)): measured exploitability
+bound halves with 4x iterations (7.3 bb/hand at 60k, 3.7 at 240k).
 
 The solver prints a UTG first-decision range and writes the full visited
 strategy to CSV: `position, history, bucket, action frequencies`.
@@ -66,6 +86,7 @@ src/
 ├── poker.h/.cpp      8-max tournament NLHE preflop game (blinds, antes,
 │                     min-raise, all-in, board chance, ICM-delta payoffs)
 ├── solver.h          game-agnostic external-sampling MCCFR (templates)
+├── eval.h/.cpp       HU chip-EV exploitability bound (best-response DP)
 ├── kuhn.h            Kuhn poker (engine validation)
 └── main.cpp          CLI, strategy extraction, CSV dump
 cuda/
@@ -87,6 +108,30 @@ The engine is validated two ways in tests:
   strategy enumeration) drops below 0.02.
 - **Harness sanity**: value/BR/exploitability functions are pinned against
   hand-computed degenerate strategies.
+
+### Correctness validation without ICM
+
+The engine is validated in `--chip-ev` mode, where payoffs are exact chip
+deltas and the game is exactly zero-sum:
+
+- **Kuhn poker** (analytic equilibrium): exploitability < 0.02 after 100k
+  iterations.
+- **Real poker exploitability** (`src/eval.h/.cpp`): for heads-up, a full
+  tree DP computes the best-response value against the trained average
+  strategy per sampled deal. Board chance and continuation terminals are
+  evaluated analytically from a per-deal all-in equity (MC over boards),
+  so no best-response decision can condition on a board it is about to
+  receive, and no maximum is taken over noisy per-branch estimates
+  (a winner's-curse bias that otherwise dominates the measurement — the
+  naive sampled evaluator reports ~50 bb/hand where the true bound is
+  ~4 bb). The result is an upper bound (per-deal greedy BR conditions on
+  hole cards; with 169 buckets the gap is suit-level slack). The
+  convergence test asserts the bound halves with 4x iterations, matching
+  ES-MCCFR theory.
+
+The chip-EV BTN value under the showdown stub is slightly negative
+(~-0.1 bb): the stub strips position, so the SB/BTN seat loses its main
+structural advantage. This is a modeling artifact, not an engine issue.
 
 ### Payoff model
 
@@ -128,8 +173,9 @@ with an all-in collapse threshold at 50% of the effective stack.
 
 - Continuation (FGS) stub only — no postflop solver yet.
 - External sampling converges as O(1/sqrt(T)); 8-max runs need many more
-  iterations than the defaults for tight ranges. No exploitability
-  measurement for the poker game yet (Kuhn only).
+  iterations than the defaults for tight ranges. Exploitability
+  measurement exists for heads-up chip-EV only (multi-way best response
+  with card removal is future work).
 - The strategy dump enumerates the public tree up to a node budget; full
   8-max trees with all raise branches are combinatorially large.
 - CUDA kernels are not validated (no NVIDIA GPU available).
@@ -139,6 +185,7 @@ with an all-in collapse threshold at 50% of the effective stack.
 ## Roadmap
 
 - [x] Game engine (external-sampling MCCFR, Kuhn-validated)
+- [x] Chip-EV mode + HU exploitability evaluator (convergence-validated)
 - [x] ICM payoffs (Harville subset DP, brute-force-tested)
 - [x] 8-max preflop state machine (blinds, antes, min-raises, side pots)
 - [x] FGS continuation interface + showdown stub
@@ -146,7 +193,7 @@ with an all-in collapse threshold at 50% of the effective stack.
 - [ ] Convergence: deeper iterations, weighted regret variants (DCFR)
 - [ ] Postflop solver to replace the continuation stub (real FGS)
 - [ ] CUDA integration into the MCCFR hot loop + validation on hardware
-- [ ] Exploitability / EV estimation for the poker game
+- [ ] Exploitability for multiway (3-8 players)
 - [ ] Multi-street FGS-across-hands for tournament dynamics
 
 ## License
