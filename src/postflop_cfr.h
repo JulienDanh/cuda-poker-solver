@@ -24,11 +24,18 @@ struct TreeAction {
 struct BetConfig {
   // Bet sizes as fractions of the (call-inclusive) pot; raises as
   // multiples of the previous bet. betAllIn adds an explicit all-in bet
-  // to every unopened street (the oracle's "a" size); all-ins near the
-  // stack cap are still auto-added by addAllinThreshold.
+  // to every unopened street (the oracle's "a" size); betGeometric adds
+  // a geometric size (the oracle's "e": ratio = ((2*SPR+1)^(1/n)-1)/2
+  // over the remaining streets n, so the ladder converges into the
+  // all-in at any stack depth). All-ins near the stack cap are still
+  // auto-added by addAllinThreshold.
   std::vector<double> betFracs = {0.5, 0.75, 1.0};
   std::vector<double> raiseMults = {2.5, 3.0};
   bool betAllIn = false;
+  bool betGeometric = false;
+  // Max non-all-in bet/raise actions per street; 0 = unlimited. With
+  // maxRaises = 2 the ladder is: bet, raise, then all-in only.
+  int maxRaises = 0;
   double addAllinThreshold = 1.5;
   double forceAllinThreshold = 0.15;
   double mergingThreshold = 0.1;
@@ -39,7 +46,9 @@ struct BetConfig {
 // street's chips, `stack` the behind-stack at the start of this street.
 std::vector<TreeAction> betActions(int64_t potBase, int64_t stack,
                                    const BetConfig& cfg, int64_t sc0,
-                                   int64_t sc1, int actor, bool afterAllin);
+                                   int64_t sc1, int actor, bool afterAllin,
+                                   int numBets = 0,
+                                   int numStreets = 1);
 
 // Result of a solve (GPU engine's final walks). Values are in chips;
 // root EVs sum to the starting pot.

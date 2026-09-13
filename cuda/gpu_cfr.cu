@@ -999,7 +999,7 @@ struct Compiler {
   int build(const uint8_t board[5], int nBoard, int64_t potBase, int64_t sc0,
             int64_t sc1, int actor, bool afterAllin, bool streetClosed,
             int depth, int comboOff0, int nC0, int comboOff1, int nC1,
-            int64_t pc0 = 0, int64_t pc1 = 0) {
+            int64_t pc0 = 0, int64_t pc1 = 0, int numBets = 0) {
     const int idx = newNode();
     NodeH& nd = nodes[idx];
     nd.depth = depth;
@@ -1139,7 +1139,8 @@ struct Compiler {
     // bet per player is capped at spot.stack across all streets,
     // matching the oracle's per-player BuildTreeInfo stacks.
     auto acts = pf::betActions(potBase, spot.stack - pc0, cfg, sc0, sc1,
-                               actor, afterAllin);
+                               actor, afterAllin, numBets,
+                               6 - nBoard);
     nd.na = (int)acts.size();
     maxNa = std::max(maxNa, nd.na);
     nd.kind = kDecide;
@@ -1155,7 +1156,7 @@ struct Compiler {
           if (actor == 0) {
             child = build(board, nBoard, potBase, sc0, sc1, 1, afterAllin,
                           false, depth + 1, comboOff0, nC0, comboOff1, nC1,
-                          pc0, pc1);
+                          pc0, pc1, numBets);
           } else {
             closed = true;  // IP checks behind: street over
           }
@@ -1198,9 +1199,11 @@ struct Compiler {
         child = build(board, nBoard, potBase, nsc0, nsc1, 0, false, true,
                       depth + 1, comboOff0, nC0, comboOff1, nC1, pc0, pc1);
       } else if (child == -1) {
+        const int nNumBets =
+            act.kind == pf::ActionKind::Check ? numBets : numBets + 1;
         child = build(board, nBoard, potBase, nsc0, nsc1, actor ^ 1,
                       nAfterAllin, false, depth + 1, comboOff0, nC0,
-                      comboOff1, nC1, pc0, pc1);
+                      comboOff1, nC1, pc0, pc1, nNumBets);
       }
       nd.children.push_back(child);
     }

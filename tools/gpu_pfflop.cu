@@ -68,8 +68,8 @@ std::vector<double> parseDoubles(const std::string& s) {
 }
 
 // Bet sizes: comma list of pot fractions, with "a" for an explicit
-// all-in bet (postflop-solver's "a" size; see pf::BetConfig::betAllIn).
-// Returns false if a token is neither numeric nor "a".
+// all-in bet and "e" for a geometric size (postflop-solver's "a"/"e"
+// sizes; see pf::BetConfig). Returns false on an unknown token.
 bool parseBetSizes(const std::string& s, pf::BetConfig& cfg,
                    bool& sawAllIn) {
   size_t start = 0;
@@ -80,6 +80,8 @@ bool parseBetSizes(const std::string& s, pf::BetConfig& cfg,
     if (!tok.empty()) {
       if (tok == "a" || tok == "A" || tok == "allin") {
         sawAllIn = true;
+      } else if (tok == "e" || tok == "E" || tok == "geo") {
+        cfg.betGeometric = true;
       } else {
         try {
           cfg.betFracs.push_back(std::stod(tok));
@@ -141,6 +143,8 @@ int main(int argc, char** argv) {
       target = std::stod(argv[++i]);
       // With a quality target, the iteration count is just a safety cap.
       if (iters < 100000) iters = 100000;
+    } else if (std::strcmp(argv[i], "--max-raises") == 0 && i + 1 < argc) {
+      cfg.maxRaises = std::atoi(argv[++i]);
     }
   }
 

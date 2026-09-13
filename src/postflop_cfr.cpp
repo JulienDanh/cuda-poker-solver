@@ -17,7 +17,8 @@ int64_t roundTo(double x) { return static_cast<int64_t>(std::llround(x)); }
 
 std::vector<TreeAction> betActions(int64_t potBase, int64_t stack,
                                    const BetConfig& cfg, int64_t sc0,
-                                   int64_t sc1, int actor, bool afterAllin) {
+                                   int64_t sc1, int actor, bool afterAllin,
+                                   int numBets, int numStreets) {
   const int64_t S = stack;
   int64_t mySc = actor == 0 ? sc0 : sc1;
   int64_t oppSc = actor == 0 ? sc1 : sc0;
@@ -41,10 +42,27 @@ std::vector<TreeAction> betActions(int64_t potBase, int64_t stack,
     return maxAmount <= amount + threshold;
   };
 
+  // Raise cap: maxRaises counts the non-all-in bet/raise actions made
+  // this street; all-in remains available (it is the terminal
+  // aggressive action) until afterAllin.
+  const bool canRaise = cfg.maxRaises <= 0 || numBets < cfg.maxRaises;
   if (toCall == 0) {
     actions.push_back({ActionKind::Check, 0});
-    for (double f : cfg.betFracs) {
-      actions.push_back({ActionKind::Bet, roundTo(f * static_cast<double>(pot))});
+    if (canRaise) {
+      for (double f : cfg.betFracs) {
+        actions.push_back({ActionKind::Bet, roundTo(f * static_cast<double>(pot))});
+      }
+      // Geometric size (the oracle's "e"): spread the SPR over the
+      // remaining streets so the ladder converges into the all-in.
+      // Mirrors action_tree.rs compute_geometric with max_ratio = inf.
+      if (cfg.betGeometric && numStreets > 0 && pot > 0) {
+        const double spr =
+            static_cast<double>(oppRemaining) / static_cast<double>(pot);
+        const double ratio =
+            (std::pow(2.0 * spr + 1.0, 1.0 / numStreets) - 1.0) / 2.0;
+        actions.push_back(
+            {ActionKind::Bet, roundTo(ratio * static_cast<double>(pot))});
+      }
     }
     if (cfg.betAllIn ||
         maxAmount <= roundTo(cfg.addAllinThreshold * static_cast<double>(pot))) {
@@ -54,9 +72,11 @@ std::vector<TreeAction> betActions(int64_t potBase, int64_t stack,
     actions.push_back({ActionKind::Fold, 0});
     actions.push_back({ActionKind::Call, 0});
     if (!afterAllin) {
-      for (double m : cfg.raiseMults) {
-        actions.push_back(
-            {ActionKind::Raise, roundTo(m * static_cast<double>(prevAmount))});
+      if (canRaise) {
+        for (double m : cfg.raiseMults) {
+          actions.push_back(
+              {ActionKind::Raise, roundTo(m * static_cast<double>(prevAmount))});
+        }
       }
       int64_t allinThreshold =
           prevAmount + roundTo(cfg.addAllinThreshold * static_cast<double>(pot));
