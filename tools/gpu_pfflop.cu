@@ -1,20 +1,20 @@
-// pfflop: range-based CFR solver for heads-up river spots
-// (parity target: b-inary/postflop-solver).
+// gpu_pfflop: GPU-CFR postflop solver (compile-to-static-dataflow +
+// CUDA graph replay; see cuda/gpu_cfr.h). Multi-street: the board
+// argument is 3, 4 or 5 cards (flop / turn / river spot).
 //
-// usage:
-//   pfflop river <board> <oop_range> <ip_range> <pot> <stack> <bets> <raises>
-//               <iters> [--algo dcfr|hs30] [--dump-tree]
-//   board: 5 cards e.g. "Qs9h2d7c8d"; ranges: postflop-solver syntax;
-//   bets/raises: e.g. "0.5,0.75,1.0" and "2.5,3.0" (see docs).
+//   gpu_pfflop postflop <board> <oop_range> <ip_range> <pot> <stack>
+//             <bets> <raises> <iters> [--algo dcfr|hs30] [--root]
 //
-// Prints:
+// Prints (plus GPU timings on stderr):
 //   EV 0 <chips> / EV 1 <chips> / EXPLOITABILITY <chips>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <vector>
 
-#include "cards.h"
+#include "gpu_cfr.h"
 #include "postflop_cfr.h"
 #include "range.h"
 
@@ -70,16 +70,25 @@ std::vector<double> parseDoubles(const std::string& s) {
 }  // namespace
 
 int main(int argc, char** argv) {
-  if (argc < 9 || std::strcmp(argv[1], "river") != 0) {
+  if (argc < 9 ||
+      (std::strcmp(argv[1], "postflop") != 0 &&
+       std::strcmp(argv[1], "river") != 0)) {
     std::fprintf(stderr,
-                  "usage: pfflop river <board> <oop_range> <ip_range> <pot> "
-                  "<stack> <bets> <raises> <iters> [--algo dcfr|hs30] "
-                  "[--dump-tree]\n");
+                  "usage: gpu_pfflop postflop <board> <oop_range> <ip_range> "
+                  "<pot> <stack> <bets> <raises> <iters> "
+                  "[--algo dcfr|hs30] [--root]\n"
+                  "  board: 3, 4 or 5 cards (flop / turn / river)\n");
     return 2;
   }
-  pf::Spot spot;
-  std::string board = argv[2];
-  for (int i = 0; i < 5; ++i) spot.board[i] = cardFromText(board, i);
+  const std::string boardStr = argv[2];
+  if (boardStr.size() != 6 && boardStr.size() != 8 && boardStr.size() != 10) {
+    std::fprintf(stderr, "board must be 3, 4 or 5 cards\n");
+    return 2;
+  }
+  gpu::PostflopSpot spot;
+  spot.nBoard = (int)(boardStr.size() / 2);
+  for (int i = 0; i < spot.nBoard; ++i)
+    spot.board[i] = cardFromText(boardStr, i);
   spot.oop = parseRange(argv[3]);
   spot.ip = parseRange(argv[4]);
   spot.pot = std::stoll(argv[5]);
@@ -89,26 +98,38 @@ int main(int argc, char** argv) {
   cfg.raiseMults = parseDoubles(argv[8]);
   int iters = std::stoi(argv[9]);
   std::string algo = "dcfr";
-  bool dumpTree = false;
   bool rootStrat = false;
-  int threads = 0;
   for (int i = 10; i < argc; ++i) {
     if (std::strcmp(argv[i], "--algo") == 0 && i + 1 < argc) {
       algo = argv[++i];
-    } else if (std::strcmp(argv[i], "--dump-tree") == 0) {
-      dumpTree = true;
     } else if (std::strcmp(argv[i], "--root") == 0) {
       rootStrat = true;
-    } else if (std::strcmp(argv[i], "--threads") == 0 && i + 1 < argc) {
-      threads = std::stoi(argv[++i]);
     }
   }
 
-  pf::RiverSolver solver(spot, cfg);
-  if (dumpTree) {
-    solver.dumpTree(stdout);
-  }
-  solver.solve(iters, algo, threads);
+  auto wall0 = std::chrono::steady_clock::now();
+  gpu::GpuPostflopSolver solver(spot, cfg);
+  auto wall1 = std::chrono::steady_clock::now();
+  std::fprintf(stderr, "gpu_cfr: nodes=%d depth=%d board=%d cards\n",
+               solver.numNodes(), solver.maxDepth(), spot.nBoard);
+  std::fprintf(stderr, "gpu_cfr: compile %.1f ms\n",
+               std::chrono::duration<double, std::milli>(wall1 - wall0).count());
+
+  cudaEvent_t t0, t1;
+  cudaEventCreate(&t0);
+  cudaEventCreate(&t1);
+  cudaEventRecord(t0);
+  solver.solve(iters, algo);
+  cudaEventRecord(t1);
+  cudaEventSynchronize(t1);
+  float ms = 0.0f;
+  cudaEventElapsedTime(&ms, t0, t1);
+  std::fprintf(stderr, "gpu_cfr: %d iters in %.1f ms (%.0f iters/s)\n", iters,
+               ms, iters / (ms / 1000.0f));
+
+  if (std::getenv("GPU_CFR_DEBUG")) solver.debugDump();
+
+  auto wall2 = std::chrono::steady_clock::now();
   if (rootStrat) {
     auto rs = solver.rootStrategy();
     std::printf("ROOTSTRAT");
@@ -116,6 +137,10 @@ int main(int argc, char** argv) {
     std::printf("\n");
   }
   auto st = solver.stats();
+  auto wall3 = std::chrono::steady_clock::now();
+  std::fprintf(stderr, "gpu_cfr: stats walk %.1f ms\n",
+               std::chrono::duration<double, std::milli>(wall3 - wall2)
+                   .count());
   std::printf("EV 0 %.6f\n", st.ev0);
   std::printf("EV 1 %.6f\n", st.ev1);
   std::printf("EXPLOITABILITY %.6f\n", st.expl);

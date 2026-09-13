@@ -102,6 +102,28 @@ fn cmd_solve(flop: &str, oop: &str, ip: &str, pot: i32, stack: i32, bet: &str,
     run_solve(&mut game, pot, iters, target)
 }
 
+fn build_game_turn(board: &str, oop: &str, ip: &str, pot: i32, stack: i32,
+                   bet: &str, raise: &str) -> Result<PostFlopGame, String> {
+    // board: 8 card string (flop + turn; river not dealt).
+    let b = board.trim();
+    let cards: String = b.chars().filter(|c| !c.is_whitespace()).collect();
+    let flop = flop_from_str(&cards[0..6])?;
+    let turn = card_from_str(&cards[6..8])?;
+    let card_config = CardConfig {
+        range: [oop.parse()?, ip.parse()?],
+        flop,
+        turn,
+        river: NOT_DEALT,
+    };
+    build_game_with_river(card_config, pot, stack, bet, raise)
+}
+
+fn cmd_solve_turn(board: &str, oop: &str, ip: &str, pot: i32, stack: i32, bet: &str,
+                  raise: &str, iters: u32, target: f32) -> Result<(), String> {
+    let mut game = build_game_turn(board, oop, ip, pot, stack, bet, raise)?;
+    run_solve(&mut game, pot, iters, target)
+}
+
 fn cmd_solve_board(board: &str, oop: &str, ip: &str, pot: i32, stack: i32, bet: &str,
                    raise: &str, iters: u32, target: f32) -> Result<(), String> {
     let mut game = build_game_river(board, oop, ip, pot, stack, bet, raise)?;
@@ -192,7 +214,8 @@ fn main() {
     let args: Vec<String> = env::args().collect();
     let usage = "usage: pfs-verify equity <flop> <oop_range> <ip_range> | \
                  pfs-verify solve <flop> <oop_range> <ip_range> <pot> <stack> <bet> <raise> <iters> | \
-                 pfs-verify solve-river <board10> <oop_range> <ip_range> <pot> <stack> <bet> <raise> <iters>";
+                 pfs-verify solve-river <board10> <oop_range> <ip_range> <pot> <stack> <bet> <raise> <iters> | \
+                 pfs-verify solve-turn <board8> <oop_range> <ip_range> <pot> <stack> <bet> <raise> <iters>";
     let res = match args.len() {
         2 if args[1] == "eval7" => cmd_eval7(),
         5 if args[1] == "equity" => {
@@ -205,6 +228,18 @@ fn main() {
             0.0,
         ),
         11 if args[1] == "solve-river" => cmd_solve_board(
+            &args[2], &args[3], &args[4],
+            args[5].parse().unwrap(), args[6].parse().unwrap(),
+            &args[7], &args[8], args[9].parse().unwrap(),
+            args[10].parse().unwrap(),
+        ),
+        10 if args[1] == "solve-turn" => cmd_solve_turn(
+            &args[2], &args[3], &args[4],
+            args[5].parse().unwrap(), args[6].parse().unwrap(),
+            &args[7], &args[8], args[9].parse().unwrap(),
+            0.0,
+        ),
+        11 if args[1] == "solve-turn" => cmd_solve_turn(
             &args[2], &args[3], &args[4],
             args[5].parse().unwrap(), args[6].parse().unwrap(),
             &args[7], &args[8], args[9].parse().unwrap(),

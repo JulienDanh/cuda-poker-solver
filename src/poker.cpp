@@ -5,6 +5,7 @@
 #include <cassert>
 #include <cmath>
 #include <map>
+#include <stdexcept>
 
 #include "showdown.h"
 

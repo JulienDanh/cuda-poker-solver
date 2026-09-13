@@ -3,17 +3,16 @@
 > Current status and what is missing: [docs/STATUS.md](docs/STATUS.md)
 > Algorithm research (modern CFR variants, GPU approaches): [docs/solver-algorithms.md](docs/solver-algorithms.md)
 
-A GPU-oriented poker solver for **8-max tournament NLHE** that plays the
-full hand — **preflop and postflop** — built around three ideas:
+A GPU-oriented poker solver. The active focus is the **GPU postflop
+solver** (heads-up, range-based, no abstraction): the bet tree is
+compiled once into flat device arrays and solved with vanilla DCFR as
+depth-level batched kernel passes replayed as a CUDA graph — the GPU-CFR
+recipe (arXiv:2609.11923). Multi-street boards are supported (flop/turn/
+river); the current focus is **turn spots** and **performance**.
 
-1. **ICM payoffs** — terminal states are evaluated as Malmuth-Harville
-   tournament-equity deltas, not chip deltas.
-2. **External-sampling MCCFR** — the equilibrium engine, game-agnostic and
-   validated on Kuhn poker against its known equilibrium.
-3. **Multi-street play** — hands run preflop, flop, turn and river with a
-   configurable bet abstraction. `--stub` reverts to the old preflop-only
-   mode where flop-bound pots resolve through an FGS `ContinuationModel`
-   (useful for cheap 8-max preflop runs).
+The repo also carries an 8-max tournament NLHE engine (ICM payoffs,
+external-sampling MCCFR, validated on Kuhn poker) reachable through
+`ppsolve`. It is not the active development focus.
 
 ## Build
 
@@ -33,8 +32,26 @@ cmake --build build-cmake
 ```
 
 The CUDA kernels (`cuda/poker_kernels.cu`: batched ICM subset-DP and board
-sampling) compile only with an NVIDIA toolkit and are currently
-**unvalidated — there is no NVIDIA GPU on the development machine**.
+sampling) compile only with an NVIDIA toolkit. They are **validated on
+hardware** (RTX 4070, sm_89, CUDA 13.x) by `build-cmake/cuda_validate`
+(`tools/cuda_validate.cu`): batched ICM matches `src/icm.cpp` to 1e-16
+across 2-8 players including zero-stack terminals, and the board sampler
+satisfies its contract with uniform card marginals. The kernels are not
+yet wired into the MCCFR hot loop.
+
+**GPU-CFR postflop solver** (`cuda/gpu_cfr.cu`, binary `gpu_pfflop`):
+the exported bet tree is compiled to static dataflow — flat node/edge
+arrays, per-node compact combo lists (chance branches drop blocked
+combos), per-node regret/strategy rows, precomputed per-river-board
+strength orders and card-conflict lists — and each DCFR iteration runs
+as depth-level batched kernel passes (fused per-depth backward kernel,
+root reach read in-kernel), with one iteration captured into a CUDA
+graph and replayed per iteration. The discount schedule is device
+-resident and advanced by the graph itself. All hot buffers are f32
+(the RTX 4070 runs fp64 at 1/64 the fp32 rate, and the parity oracle is
+itself an f32 solver); host-side final walks accumulate in f64.
+Turn-spot throughput on the RTX 4070: ~4,200 iters/s on a 6k-node tree,
+~700 iters/s on a 52k-node tree (see `make turn-bench`).
 
 Two payoff modes: `--chip-ev` (default off) evaluates terminals as chip
 deltas — the correctness-validation mode (exactly zero-sum, no ICM
@@ -106,10 +123,18 @@ make verify-pfs   # evaluator ordering cross-check (N random 7-card hands)
 make stub-bias    # FGS stub EV-bias measurement vs full postflop solves
 ```
 
-For the range-based river solver (pfflop), the quality gates are:
-`make river-parity` (head-to-head vs the oracle: EV, exploitability band,
-root strategy), `make river-quality` (deterministic golden baseline +
-monotone convergence), `make river-bench` (performance tracking).
+For the GPU postflop solver, the quality gates are:
+
+- `make gpu-quick` — the fast debug loop (~20 s): turn spots vs the
+  oracle at low iteration counts with loose gates, plus the
+  hand-computed tiny-turn ground truth (`tools/tiny_check.cpp`).
+- `make gpu-parity` — the full commit gate (~20 s): six turn geometries
+  at 500 iterations with tight gates (EV within 0.01 chips of the
+  oracle, exploitability ratio within [0.5, 2], root strategy within
+  0.10) plus the ground truth.
+- `make turn-bench` — performance tracker with a per-phase breakdown
+  (compile / solve / stats walk).
+
 See docs/STATUS.md for the harness design and tolerances.
 
 **Evaluator cross-check** (`tools/verify_eval7.cpp` + `pfs-verify eval7`):
@@ -154,18 +179,27 @@ src/
 │                     hand bucketing)
 ├── solver.h          game-agnostic external-sampling MCCFR (templates)
 ├── eval.h/.cpp       HU chip-EV exploitability bound (best-response DP)
+├── range.h/.cpp      postflop-solver-syntax range parser
+├── postflop_cfr.h/.cpp  bet-tree abstraction (pf::betActions), shared by
+│                     the GPU tree builder; mirrors postflop-solver's
+│                     action_tree.rs (pot-relative bets, prev-bet-relative
+│                     raises, all-in capping/merging)
 
 tools/
 ├── verify_eval7.cpp     evaluator cross-check driver (see make verify-pfs)
+├── tiny_check.cpp       hand-computed tiny-turn ground truth (f64)
+├── gpu_pfflop.cu        GPU postflop solver CLI (flop/turn/river boards)
+├── cuda_validate.cu     on-hardware kernel validation vs the CPU reference
+├── quality/            the gate scripts (gpu-quick/gpu-parity/turn-bench)
 └── pfs-verify/          Rust harness around b-inary/postflop-solver
-    ├── src/main.rs      eval7 / equity / solve subcommands
+    ├── src/main.rs      eval7 / equity / solve / solve-turn subcommands
     └── third_party/     vendored postflop-solver (AGPL, local patch)
-├── kuhn.h            Kuhn poker (engine validation)
-└── main.cpp          CLI, strategy extraction, CSV dump
 cuda/
-└── poker_kernels.cu  batched ICM + board sampling kernels (optional)
+├── gpu_cfr.cu/.h    GPU-CFR postflop engine (compile-to-dataflow + CUDA
+│                     graph replay, f32 rows, multi-street chance nodes)
+└── poker_kernels.cu batched ICM + board sampling kernels (optional)
 tests/
-└── test_main.cpp     20 unit tests
+└── test_main.cpp     32 unit tests
 ```
 
 ### The MCCFR engine
@@ -266,7 +300,8 @@ with an all-in collapse threshold at 50% of the effective stack.
   with card removal is future work).
 - The strategy dump enumerates the public tree up to a node budget; full
   8-max trees with all raise branches are combinatorially large.
-- CUDA kernels are not validated (no NVIDIA GPU available).
+- CUDA kernels are validated on hardware (RTX 4070) but not yet called
+  from the MCCFR hot loop.
 - Single-hand equilibrium from one tournament state: no FGS-across-hands
   (future blind-level/stack-dynamics modeling).
 
@@ -281,21 +316,28 @@ with an all-in collapse threshold at 50% of the effective stack.
 - [x] Evaluator cross-validated against postflop-solver (found and fixed
   a double-trips full-house bug; 8M hands, zero violations)
 - [x] Range-based river solver at parity with postflop-solver: identical
-  bet trees, vanilla DCFR with the oracle's exact discounting, EVs match
-  to ~1e-4 of the pot and exploitability matches along the whole
-  iteration trajectory; HS-DCFR(30) (2026 SOTA) also implemented
-  (src/postflop_cfr.*, build/pfflop, make river-parity)
+  bet trees, vanilla DCFR with the oracle's exact discounting; HS-DCFR(30)
+  also implemented. (The CPU river solver has since been removed; the
+  GPU engine is validated directly against the oracle.)
 - [x] 8-max preflop state machine (blinds, antes, min-raises, side pots)
 - [x] FGS continuation interface + showdown stub
-- [x] CLI + CSV strategy dump
-- [ ] Convergence: deeper iterations, weighted regret variants (DCFR)
-- [ ] Better postflop abstraction (equity clustering: OCHS / k-means)
-- [ ] Postflop strategy output (CSV dump covers preflop only)
-- [ ] Preflop strategies validated against postflop-solver spot solves
-- [ ] CUDA integration into the MCCFR hot loop + validation on hardware
-- [ ] CUDA integration into the MCCFR hot loop + validation on hardware
-- [ ] Exploitability for multiway (3-8 players)
-- [ ] Multi-street FGS-across-hands for tournament dynamics
+- [x] CLI + CSV strategy dump (ppsolve)
+- [x] CUDA kernels validated on hardware (RTX 4070): batched ICM matches
+  the CPU reference to 1e-16 (2-8 players, zero stacks included); board
+  sampling contract + chi-square uniformity (`tools/cuda_validate.cu`)
+- [x] GPU-CFR postflop engine: compile-to-dataflow + CUDA graph replay,
+  multi-street (flop/turn/river) with per-branch combo sub-ranges
+  (`cuda/gpu_cfr.*`, `gpu_pfflop`)
+- [x] Turn-spot oracle parity: EV within 0.01 chips of postflop-solver
+  across six geometries, plus the hand-computed tiny-turn ground truth
+  (`make gpu-parity`)
+- [x] f32 hot path (rows + kernels; host walks accumulate f64) with the
+  fold-terminal card sums scattered via shared atomics
+- [ ] Turn-solver performance: identified next lever is the showdown
+  base-space walk (fused zero/gather/scan via precomputed reverse maps)
+- [ ] Flop spots: supported by the engine, gated and benchmarked only
+  after the turn performance work
+- [ ] Preflop solver work is out of current scope (dropped)
 
 ## License
 

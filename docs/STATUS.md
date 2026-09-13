@@ -1,221 +1,173 @@
 # Project status
 
 Where the solver stands, what is validated, and what is missing.
-Last updated: after commit aab9688 (multi-street play).
+Last updated: after the multi-street GPU turn milestone (f32 hot path,
+turn-oracle parity, turn-only focus).
+
+## 0. Scope
+
+The active project is the **GPU postflop solver** (heads-up, range-based,
+no abstraction): `cuda/gpu_cfr.*` behind the `gpu_pfflop` CLI. Multi
+-street boards (flop/turn/river) are supported by the engine; the current
+focus is **turn spots and performance**. Flop spots are deferred until
+the turn performance work is done. **Preflop solver work (the 8-max
+MCCFR/ICM engine, FGS) is out of scope** — the engine still builds and
+its tests still pass (`ppsolve`), but no further work is planned on it.
+
+The CPU range-based river solver (`pfflop`) has been removed: with the
+GPU engine validated directly against the postflop-solver oracle, it was
+a redundant middle rung. Its bet-tree construction lives on as
+`pf::betActions` (src/postflop_cfr.*), which the GPU tree builder calls.
 
 ## 1. What exists and is validated
 
-### Equilibrium engine
-- **External-sampling MCCFR** (`src/solver.h`): game-agnostic (template
-  over the game), multithreaded via per-thread tables merged at the end,
-  linear-weighted average strategy.
-- Validated on **Kuhn poker**: exact exploitability (pure-strategy
-  enumeration) < 0.02 after 100k iterations, with the value/BR harness
-  itself pinned against hand-computed degenerate strategies.
+### GPU postflop solver (the focus)
 
-### Hand evaluation
-- 5–7 card evaluator (`evaluateN`) with complete category and kicker
-  ordering.
-- Cross-validated against **b-inary/postflop-solver's** evaluator
-  (`make verify-pfs`): 8 million random 7-card hands, zero ordering
-  violations (equal hands equal, stronger hands stronger). This check
-  found a real bug (double-trips full houses, now fixed and regression
-  tested).
-
-### Game domain (heads-up through 8-max)
-- Full multi-street NLHE: preflop, flop, turn, river; blinds, antes,
-  min-raise rules, all-in runouts, short all-ins (betting continues
-  between covered players), uncalled-bet returns, side-pot layering,
-  tie splits.
-- Two payoff modes: **chip-EV** (exactly zero-sum, the correctness
-  mode) and **ICM** (Malmuth-Harville subset DP, zero-stack-safe,
-  brute-force tested).
-- Preflop abstraction: exact 169 canonical hands, or 15 coarse buckets.
-- Postflop abstraction: made-hand category x rank tier (27 buckets per
-  street) or exact-board keys (`--postflop-exact`).
-- Optional FGS continuation mode (`--stub`): flop-bound pots resolve
-  through a `ContinuationModel` (default: seeded showdown stub).
+- **Compile-to-dataflow** (GPU-CFR, arXiv:2609.11923): the bet tree is
+  built once on the host (`pf::betActions` — postflop-solver's exact bet
+  abstraction) and flattened into device arrays: node kinds/children,
+  per-node compact combo lists (chance branches drop blocked combos),
+  per-node regret/strategy rows, chance-branch CSR maps, per-river-board
+  strength tables with card-conflict lists.
+- **Solving**: vanilla full-tree DCFR (or HS-DCFR(30)) with alternating
+  updates and regret-matching+, run as depth-level batched kernel passes
+  (forward reach, fused backward cfv+update), one iteration captured into
+  a CUDA graph and replayed per iteration; the discount schedule is
+  device-resident and advanced by the graph itself.
+- **Multi-street chance semantics** (all ground-truth-validated,
+  tools/tiny_check.cpp): chance weight 1/(52 − nBoard − 4) per valid
+  branch (per-pair hole-card masking), prior-street contributions
+  tracked for value baselines, the behind-stack shrinks by prior streets'
+  matched contributions, and a dead street (nothing behind) deals through
+  chance to showdown.
+- **Precision**: all hot device buffers and kernels are f32 — the RTX
+  4070 executes fp64 at 1/64 the fp32 rate, and the parity oracle is
+  itself an f32 solver. The discount schedule is computed in f64 on the
+  host and uploaded f32; the final EV/exploitability walks accumulate in
+  f64 on the host over f32 rows.
 
 ### Correctness measurements that pass today
+
 | Check | Result |
 |---|---|
-| 29 unit tests | all pass |
-| Evaluator vs postflop-solver | 8M hands, 0 violations |
-| Kuhn exploitability | < 0.02 after 100k iters |
-| HU preflop exploitability (chip-EV) | 7.3 bb/hand @ 60k, 3.7 @ 240k — halves with 4x iterations (ES-MCCFR O(1/sqrt(T)) confirmed) |
-| Chip payoffs | zero-sum invariants for fold, all-in, continuation, multi-street |
-| 8-max ICM preflop ranges | directionally sane (UTG folds low offsuit ~100%, opens broadway ~98%) |
-| Mode comparison (HU chip-EV, 150k iters) | BTN/SB: -0.065 bb with the position-blind stub, **+0.154 bb** with postflop play — matches the measured stub bias |
-| FGS stub bias vs real postflop solves | OOP overvalued by ~4% of pot on average (-3.4%, -11.2%, +2.3% across three flops) |
+| 32 unit tests | all pass |
+| Evaluator vs postflop-solver (`make verify-pfs`) | 8M hands, 0 violations |
+| Kuhn exploitability (MCCFR engine) | < 0.02 after 100k iters |
+| Turn spots vs postflop-solver oracle (`make gpu-parity`) | 6 geometries x 500 iters: EV within 0.01 chips (measured max 0.0034), expl ratio in [0.5, 2] (measured [0.64, 1.13]), root strategy within 0.10 |
+| Tiny-turn ground truth (`tools/tiny_check.cpp`) | uniform + 2 seeded profiles match the f64 hand computation to 1e-4 (measured 2-5e-6; f32 walk) |
+| Quick gate (`make gpu-quick`) | same spots at 200 iters with loose gates, ~20 s |
+| Chip payoffs (engine invariants) | zero-sum for fold/all-in/continuation/multi-street |
+| 8-max ICM preflop ranges (engine) | directionally sane (kept, out of scope) |
 
-### Tooling
-- CLI (`ppsolve`): seats 2–8, stacks, payouts, bet abstraction (preflop
-  + per-street), `--chip-ev`, `--postflop`/`--stub`, `--postflop-exact`,
-  `--mc-value N` (Monte-Carlo rollout value per seat),
-  `--exploitability N` (HU, preflop-only game), CSV preflop strategy
-  dump, UTG range print.
-- `tools/pfs-verify`: harness around vendored postflop-solver (AGPL;
-  patched to expose its evaluator): `make verify-pfs` (evaluator
-  cross-check), `make stub-bias` (stub bias vs full flop solves).
-- Build: Makefile (CPU), CMakeLists with optional CUDA target.
+### Performance (turn spots, RTX 4070, `make turn-bench`, 2000 iters)
+
+| spot | nodes | compile | solve | iters/s |
+|---|---|---|---|---|
+| shortstack (all-in runout) | 537 | ~195 ms | 101 us/iter | ~9,900 |
+| standard (200 pot, 500 stack) | 5,943 | ~205 ms | 237 us/iter | ~4,200 |
+| wide/deep (1500 stack, 4+ sizes) | 51,903 | ~230 ms | ~1,400 us/iter | ~700 |
+
+Per-iteration cost is dominated by the solve replay; compile is a fixed
+~200 ms (mostly CUDA context init on WSL); the stats walk is single-digit
+ms. Work log for the turn perf phase (all gated by `make gpu-quick`
+after each step):
+
+1. **f32 hot path** (rows + kernels; f64 only on the host walks): 1.8x.
+   The wide tree is not fp64-ALU-bound but per-node work + traffic.
+2. **Fold-terminal card sums via shared atomics** (each combo scatters
+   its reach to its two cards) replacing 52 threads each scanning the
+   whole base range: 1.5-1.6x, and numerically cleaner (EV diffs vs the
+   oracle improved).
+3. **kThreads 256 -> 128** (more resident blocks per SM): 1.25x on the
+   wide tree. 64 regresses small/launch-bound trees.
+4. **Tried and reverted**: batching 8 nodes per block — 2-4x *slower*;
+   the serial node loop with block-wide syncs destroyed cross-node
+   concurrency. Block launch/scheduling is not the bottleneck; the
+   remaining cost is the per-node base-space work itself.
+
+Cumulative turn throughput: ~3.5x (wide 193 -> ~700, standard 1401 ->
+~4,200 iters/s).
 
 ### Bugs found by validation so far (all fixed)
+
 1. Showdown winner comparison inverted (kept the *worst* hand).
 2. ICM NaN on zero-chip stacks silently froze whole infosets at uniform.
 3. Double-trips hands misclassified as trips instead of full house.
 4. Preflop calls charged blind-minus-ante (antes absorbed into calls).
 5. Bucket label arrays out of order relative to the encoding.
-6. Exploitability evaluator winner's-curse: BR max over noisy
-   single-sample boards inflated the bound from ~4 bb to ~50 bb.
+6. Exploitability evaluator winner's-curse (BR max over noisy samples).
+7. **Multi-street behind-stack bug** (found by the turn-oracle gate):
+   the tree builder passed the original stack to every street's bet
+   abstraction, allowing over-betting after prior-street chips went in —
+   a persistent ~0.38-chip EV gap vs the oracle on turn spots (both
+   engines converged, to different games). Fix: the behind-stack shrinks
+   by prior-street matched contributions; the dead street (all-in runout)
+   deals through chance to showdown instead of recursing on AllIn(0).
 
-## 2. What is missing
+## 2. What is missing (turn focus, highest impact first)
 
-### Solver quality (highest impact first)
-1. **Postflop abstraction is crude.** Category x rank tier ignores
-   draws, board texture, and opponent-range interaction. Needed: equity
-   clustering (OCHS / k-means over expected-hand-strength histograms),
-   likely also opponent-clustering for multiway. This is the single
-   biggest lever on postflop strategy quality.
-2. **Convergence speed.** External sampling converges O(1/sqrt(T));
-   HU preflop-only is still 3.7 bb/hand exploitable at 240k iterations,
-   and the multi-street game needs vastly more. Missing: DCFR/CFR+
-   regret discounting, vanilla (full-tree) CFR for HU where the tree is
-   small enough, better parallel aggregation than merge-at-end.
-3. **Multi-street exploitability.** The analytic best-response evaluator
-   covers the preflop-only game only (street chances cannot be collapsed
-   analytically once betting follows them). Postflop convergence is
-   currently only observable via `--mc-value`. Needed: a proper
-   multi-street BR (average over sampled boards at each chance node) or
-   a per-street abstraction-consistent BR.
-4. **Multiway best response.** No exploitability for 3–8 players (BR
-   with card removal across many hands is a project of its own).
-5. **Tournament FGS (across hands).** The solver computes a single-hand
-   equilibrium from one tournament state. Nothing models future hands,
-   blind levels, or stack dynamics (the original "FGS" idea in the
-   tournament sense). All ICM decisions are single-hand.
-6. **The FGS stub is not replaced by a real continuation solver.** In
-   `--stub` mode it still carries the measured ~4%-of-pot OOP bias. If
-   8-max preflop runs matter, a smarter continuation model (e.g. a
-   small postflop solve per terminal class) is wanted.
+1. **Showdown base-space walk** — the identified next perf lever. Every
+   showdown node zeroes/loads its opponent reach over the full base range
+   and block-scans it in strength-sorted order (plus a separate gather
+   pass). A precomputed per-node reverse map (base slot -> node-local
+   index) would fuse the zero/gather passes and drop two syncs; the
+   card-correction loops can read through the same map.
+2. **Launch-bound small trees** — the ~61-graph-node replay costs
+   ~100 us on WSL regardless of tree size (the shortstack spot is pure
+   floor). Fusing the same-depth forward decide+chance kernels and the
+   per-depth backward dispatch would cut graph nodes ~30%.
+3. **Flop spots** — engine support exists (3-card boards), but gates
+   (`make gpu-quick`/`gpu-parity`) and `turn-bench` cover turn only, by
+   decision, until the turn perf work lands. The oracle flop solves are
+   also ~50x the turn cost per iteration, which would slow the loop.
+4. **Strategy output** — only the root aggregate is exposed (`--root`).
+   No per-node strategy dump, no save/load of trained solutions, no
+   spot-query interface.
+5. **Exploitability** is measured per solve (EV + BR walk) but there is
+   no multiway (3+ player) support at all in the GPU engine.
+6. **No continuous integration**; the gates are run manually.
 
-### Performance
-7. **CUDA is written but dead code.** `cuda/poker_kernels.cu` (batched
-   ICM, board sampling) has never been compiled or run — no NVIDIA GPU
-   on the dev machine, and the MCCFR hot loop does not call them at all.
-   This is the repo's founding goal and is entirely undone. Needs:
-   kernel validation on hardware, GPU infoset table / regret updates,
-   batched-equity pipeline, and a CPU/GPU benchmark.
-8. **CPU hot loop is unoptimized.** State copies per action,
-   `unordered_map` infoset storage, per-node allocations. Feasible:
-   flat arrays with interned infoset ids, incremental state updates,
-   SIMD evaluator, prefetched ICM tables. Expect 5–20x before touching
-   CUDA.
-9. **8-max postflop is not tractable on CPU** at current abstraction
-   quality and iteration counts (1.5M infosets after only 1500
-   iterations). Requires items 1–2 plus 7.
+## 3. Quality harness (the gates)
 
-### Output and tooling
-10. No postflop strategy output: the CSV dump covers preflop decision
-    nodes only; postflop infosets are trained but invisible.
-11. No save/load of trained solutions (results are recomputed each
-    run).
-12. No spot-query interface (given a hand + history, print the
-    strategy/EV), no subtree locking / exploitative re-solve.
+The gates live in `tools/quality/`, wired into the Makefile. The
+workflow for any change to the GPU engine:
 
-### Validation gaps
-13. Postflop strategies are not yet compared against postflop-solver
-    spot solves (only the stub-bias EV measurement exists).
-14. No continuous integration; tests are run manually (`make test`,
-    `make verify-pfs`).
-15. ICM multiway equilibria are validated structurally, not against an
-    external reference (none exists in the toolchain).
+    make gpu-quick            # fast debug loop (~20 s)
+    make gpu-parity           # full commit gate (~20 s)
+    make turn-bench           # before/after numbers
 
-## 3. Quality harness (the gates for performance work)
+- `make gpu-quick` — turn spots vs the postflop-solver oracle at 200
+  iterations with loose gates (EV 0.10, expl ratio [0.25, 4], strategy
+  0.15) plus the tiny-turn ground truth (1e-4). Catches tree/convention
+  regressions fast: the bugs this harness found (the 0.38-chip
+  behind-stack gap, the all-in-runout recursion) show up at any
+  iteration count.
+- `make gpu-parity` — six turn geometries at 500 iterations with tight
+  gates (EV 0.01, expl ratio [0.5, 2], strategy 0.10) plus the ground
+  truth. The tight EV gate is meaningful because the oracle is f32 like
+  the GPU path.
+- `make turn-bench` — four turn geometries with a phase breakdown
+  (compile / solve / stats).
+- `make test` — 32 unit tests (engine invariants, MCCFR convergence,
+  range parser, evaluator, poker state machine).
+- `make verify-pfs` — evaluator cross-check vs the oracle (8M hands).
 
-The performance phase must not regress quality. Three gates, all wired
-into the Makefile:
-
-- `make test` — 33 unit tests: engine invariants (EV-sum-to-pot at every
-  iteration, hand-derived uniform-strategy values, tie-board equilibrium),
-  range parser, evaluator cross-check, poker state machine, Kuhn/MCCFR
-  convergence.
-- `make river-parity` — head-to-head vs postflop-solver on 8 spots x 3
-  geometries: EV within 0.01 chips, exploitability ratio within [0.5, 2.0]
-  (measured cross-arithmetic noise band: 0.88-1.48), root strategy within
-  0.10 per action. Requires cargo.
-- `make river-quality` — oracle-free golden baseline (12 spot/iteration
-  points) + monotone-convergence ladder. The solver is deterministic, so
-  EV diffs are exactly 0 today: any drift trips immediately. After an
-  INTENTIONAL quality change: `make river-baseline` regenerates.
-- `make river-bench` — performance tracker (currently ~51k iters/s small
-  spot, ~7k iters/s wide-config spot).
-
-Workflow for any performance change:
-    make test river-parity river-quality   # must pass
-    make river-bench                       # before/after numbers
-The exploitability gates are deliberately loose (2x) because they
-compare at fixed iteration counts where f64-vs-f32 convergence wobble
-is real; the EV gates (0.02 chips absolute) are the tight ones.
+The quick/full split exists because the gates serve two different jobs:
+the quick gate answers "did I break the conventions/tree" in 20 s while
+iterating; the full gate answers "is the solver still at oracle parity"
+before a commit. The tiny ground truth is engine-independent (a hand
+-computed f64 brute force) and runs in both.
 
 ## 4. Recommended next steps
 
-### Performance work log (river solver)
-
-- Fold-terminal fast path: `disjointMass()` (O(52+n) per-card sums +
-  sameOther add-back) replaced the full 3-sweep showdown scan at every
-  fold terminal. Small spot 41k -> ~50k iters/s.
-- Right-sized per-depth scratch (PassCtx): the old fixed-stride
-  (8x1326) scratch put every buffer tens of KB apart; contiguous
-  per-depth regions improved wide-spot serial speed ~2x (3-4k -> 7-8k
-  iters/s).
-- Parallel passRec (fork-join, opt-out via `--threads`): a DECIDE node
-  with enough subtree work fans out per-action child evaluations as
-  jobs over a work-sharing pool; aggregation is in fixed action order,
-  so results are bit-identical to serial (enforced by a unit test and
-  the golden baseline). Measured on M1 (4 P-cores + 4 E-cores):
-  - Auto = one worker per P-core: wide spot ~4k -> ~7-8k iters/s.
-  - More threads than P-cores is COUNTERPRODUCTIVE (E-cores run the
-    jobs 3-5x slower and straggle at every join; 8 threads ~1k).
-  - What made it work: `QOS_CLASS_USER_INTERACTIVE` on workers
-    (keeps them on P-cores), always-spinning workers (cv wake costs
-    more than a job), lock-free queue-empty check (no mutex
-    contention while spinning), and gating fan-out to subtrees with
-    >= ~30-60us of work (finer fan-out loses to fork-join overhead;
-    per-node bodies are only 1-2us).
-  - Remaining limit: tree-granular fan-out leaves the aggregation and
-    the sequential alternating half-steps serial. Next lever is the
-    level-synchronous (bottom-up by depth) restructure — process all
-    nodes of a depth level in parallel across nodes and combos (the
-    GPU-CFR layout in docs/solver-algorithms.md); it also unlocks
-    SIMD over the per-combo loops.
-
-First goal: **parity with postflop-solver as a range-based postflop
-solver**. Research in docs/solver-algorithms.md concluded. Status: the
-river milestone is DONE — src/postflop_cfr.{h,cpp} (pfflop CLI) solves
-river spots with vanilla DCFR using the oracle's exact discounting, and
-matches postflop-solver's EVs to ~1e-4 chips and exploitability along
-the whole iteration trajectory (make river-parity). Two algorithms are
-implemented: parity DCFR and HS-DCFR(30), the 2026 state of the art
-(HS is 2-4x faster early; parity DCFR with its power-of-4 average reset
-polishes tighter at 1000+ iterations). Remaining for full parity:
-turn and flop chances (the tree/chance machinery is designed for it),
-16-bit compression, suit isomorphism, and the performance engineering
-(SIMD/flat arrays). Next: 
-
-1. Build the range-based postflop engine with vanilla **DCFR** using
-   postflop-solver's exact update rules (alternating updates, RM+,
-   alpha_t = t^1.5/(t^1.5+1), beta_t = 0.5, gamma_t with power-of-4
-   reset) so A/B comparisons against the oracle isolate implementation
-   bugs, not algorithm differences. River-only first (no chance nodes),
-   then turn, then flop.
-2. Implement **HS-DCFR(30)** schedules (the 2026 SOTA, ~15 lines on top
-   of DCFR) behind a flag and measure both against the oracle.
-3. Keep sampled MCCFR for 8-max preflop; vanilla DCFR is for spot
-   solving where accuracy is the goal.
-4. When targeting CUDA: compile the game to static dataflow with
-   depth-level batched passes + CUDA Graph replay (the GPU-CFR
-   approach), not per-node kernels; the flat layout is worth adopting
-   on CPU first. A range module (src/range.h/.cpp, postflop-solver
-   syntax subset) is already in place.
-5. Then: equity-clustering abstraction for multi-street MCCFR, postflop
-   strategy CSV + save/load, multiway BR, FGS-across-hands.
+1. **Showdown reverse-map fusion** (item 1 above): precompute per
+   showdown node a base-slot -> local-index map (~13 MB for a 52k-node
+   tree), fuse the zero+fill+gather passes, route the card-correction
+   reads through it. Measure with `make turn-bench`, gate with
+   `make gpu-quick`.
+2. Forward kernel fusion for the graph-node count (item 2), if small
+   trees matter.
+3. Then flop spots: add 3-card boards back to the gates with
+   `pfs-verify solve` (already exposed), at reduced iteration counts
+   (the oracle flop solve is ~30 s at 300 iterations).
+4. Then: per-node strategy dump / save-load / spot query (item 4).

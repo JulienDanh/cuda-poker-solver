@@ -38,50 +38,83 @@ __device__ __forceinline__ double subsetProbGpu(uint32_t S, const double* stacks
 }
 
 // stacks: [batch][n] int64; payouts: [numPayouts] double (sum == 1).
-// out: [batch][n] equity.
+// out: [batch][n] equity. Mirrors src/icm.cpp including the zero-stack
+// normalization: players with 0 chips can never finish above a player with
+// chips, so positive stacks compete Harville-style for the top m payouts
+// and zero stacks split the tail evenly.
 __global__ void icmBatchKernel(const int64_t* __restrict__ stacks, int n,
                                int batch, const double* __restrict__ payouts,
                                int numPayouts, double* __restrict__ out) {
   int item = blockIdx.x * blockDim.x + threadIdx.x;
   if (item >= batch) return;
-  extern __shared__ double smem[];  // see dynamic size computation on the host
-  double* sStacks = smem;                            // n
-  double* memo = smem + kMaxPlayersGpu;              // 1 << n
-  double* subsetSum = memo + (1 << n);               // 1 << n
+  // Thread-private scratch (NOT shared memory, which is per block and
+  // would be clobbered by the other threads of this block).
+  double sStacks[kMaxPlayersGpu];
+  double memo[1 << kMaxPlayersGpu];
+  double subsetSum[1 << kMaxPlayersGpu];
 
-  const int full = 1 << n;
+  // Compact the positive stacks to the front; remember the source seats.
+  int origIdx[kMaxPlayersGpu];
+  int m = 0;
   double total = 0.0;
   for (int i = 0; i < n; ++i) {
-    sStacks[i] = static_cast<double>(stacks[item * n + i]);
-    total += sStacks[i];
+    double s = static_cast<double>(stacks[item * n + i]);
+    if (s > 0.0) {
+      sStacks[m] = s;
+      origIdx[m] = i;
+      total += s;
+      ++m;
+    }
   }
+  if (m == 0) {
+    double sum = 0.0;
+    for (int p = 0; p < numPayouts; ++p) sum += payouts[p];
+    for (int i = 0; i < n; ++i) out[item * n + i] = sum / n;
+    return;
+  }
+
+  const int full = 1 << m;
+  // subsetSum[0] must be set before the fill loop: S=1 reads S&(S-1)=0.
+  subsetSum[0] = 0.0;
+  memo[0] = 1.0;
   for (int S = 1; S < full; ++S) {
     int low = __ffs(S) - 1;
     subsetSum[S] = subsetSum[S & (S - 1)] + sStacks[low];
     memo[S] = -1.0;
   }
-  subsetSum[0] = 0.0;
-  memo[0] = 1.0;
 
-  for (int i = 0; i < n; ++i) {
-    double eq = 0.0;
-    for (int place = 1; place <= n; ++place) {
-      double pay = place <= numPayouts ? payouts[place - 1] : 0.0;
-      if (pay == 0.0) continue;
+  const int topPayouts = m < numPayouts ? m : numPayouts;
+  double eq[kMaxPlayersGpu];
+  for (int k = 0; k < m; ++k) eq[k] = 0.0;
+  for (int place = 1; place <= m; ++place) {
+    double pay = place <= topPayouts ? payouts[place - 1] : 0.0;
+    if (pay == 0.0) continue;
+    for (int k = 0; k < m; ++k) {
       double p = 0.0;
       for (uint32_t S = 0; S < static_cast<uint32_t>(full); ++S) {
-        if (S & (1u << i)) continue;
+        if (S & (1u << k)) continue;
         if (__popc(S) != place - 1) continue;
         if (place == 1) {
-          p += sStacks[i] / total;
+          p += sStacks[k] / total;
         } else {
           double a = subsetProbGpu(S, sStacks, total, memo, subsetSum);
-          p += a * sStacks[i] / (total - subsetSum[S]);
+          p += a * sStacks[k] / (total - subsetSum[S]);
         }
       }
-      eq += pay * p;
+      eq[k] += pay * p;
     }
-    out[item * n + i] = eq;
+  }
+
+  if (m == n) {
+    for (int k = 0; k < m; ++k) out[item * n + k] = eq[k];
+  } else {
+    // Zero-stack players split the remaining tail payouts evenly.
+    double tail = 0.0;
+    for (int j = m; j < numPayouts; ++j) tail += payouts[j];
+    for (int k = 0; k < m; ++k) out[item * n + origIdx[k]] = eq[k];
+    for (int i = 0; i < n; ++i) {
+      if (stacks[item * n + i] <= 0) out[item * n + i] = tail / (n - m);
+    }
   }
 }
 
@@ -136,11 +169,18 @@ __global__ void boardBatchKernel(const uint8_t* __restrict__ holes, int batch,
 inline cudaError_t launchIcmBatch(const int64_t* dStacks, int n, int batch,
                                   const double* dPayouts, int numPayouts,
                                   double* dOut, cudaStream_t stream = 0) {
+  // The kernel keeps its per-thread DP scratch (memo/subsetSum, up to
+  // (1<<n) doubles each) on the device stack; the 1KB default limit is
+  // too small and causes illegal memory accesses. Set once per process.
+  static bool stackLimitSet = [] {
+    cudaDeviceSetLimit(cudaLimitStackSize, 16 * 1024);
+    return true;
+  }();
+  (void)stackLimitSet;
   int threads = 128;
   int blocks = (batch + threads - 1) / threads;
-  size_t smem = (kMaxPlayersGpu + 2 * (1u << n)) * sizeof(double);
-  icmBatchKernel<<<blocks, threads, smem, stream>>>(dStacks, n, batch, dPayouts,
-                                                   numPayouts, dOut);
+  icmBatchKernel<<<blocks, threads, 0, stream>>>(dStacks, n, batch, dPayouts,
+                                                numPayouts, dOut);
   return cudaGetLastError();
 }
 

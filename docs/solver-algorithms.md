@@ -87,6 +87,18 @@ PCFR+.
   vs prior GPU CFR on one A100; 14-258x vs LiteEFG CPU on the largest
   games. Notably, the compiled flat representation alone is 2.2-51.1x
   faster on CPU — i.e., do this even before targeting a GPU.
+  **Implemented, multi-street** (`cuda/gpu_cfr.*`, `gpu_pfflop`): tree
+  exported flat with per-branch combo sub-ranges and per-river-board
+  strength tables, depth-level forward/backward kernels, CUDA graph
+  replay with a device-resident discount schedule, f32 hot path
+  (consumer GPUs run fp64 at 1/64 rate; the f32 oracle makes this also
+  the right precision class for parity). Turn-spot parity vs
+  postflop-solver is gated by `make gpu-parity` (EV within 0.01 chips);
+  the hand-computed tiny-turn ground truth (`tools/tiny_check.cpp`)
+  pins the chance conventions exactly. The per-graph-node replay floor
+  is ~100us on WSL (~1.5us/graph node), so small trees are
+  launch-bound; big trees are per-node-work bound (see docs/STATUS.md
+  for the perf log).
 - **Matrix-form CFR** (arXiv 2408.14778): CFR as dense/sparse
   matrix/vector products; 203x vs OpenSpiel C++ on larger games; higher
   memory use.

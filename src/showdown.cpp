@@ -23,7 +23,7 @@ std::array<int64_t, kMaxSeats> distributeShowdown(
   int64_t uncalled = contribs.size() >= 2 ? contribs[0] - contribs[1] : 0;
   if (contribs.size() == 1) uncalled = 0;  // sole survivor: no bet is "called"
   int64_t eff[kMaxSeats] = {0};
-  for (int s = 0; s < kMaxSeats; ++s) eff[s] = contributed[s];
+  for (int s = 0; s < numPlayers; ++s) eff[s] = contributed[s];
   if (uncalled > 0) {
     for (int s : inHand) {
       if (contributed[s] == contribs[0]) {

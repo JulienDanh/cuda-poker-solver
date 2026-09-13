@@ -4,6 +4,8 @@
 *.exe
 bin/
 build/
+build-cmake/
+build-cuda/
 out/
 
 # CUDA
