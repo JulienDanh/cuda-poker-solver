@@ -131,11 +131,16 @@ int main(int argc, char** argv) {
   int iters = std::stoi(argv[9]);
   std::string algo = "dcfr";
   bool rootStrat = false;
+  double target = -1.0;
   for (int i = 10; i < argc; ++i) {
     if (std::strcmp(argv[i], "--algo") == 0 && i + 1 < argc) {
       algo = argv[++i];
     } else if (std::strcmp(argv[i], "--root") == 0) {
       rootStrat = true;
+    } else if (std::strcmp(argv[i], "--target") == 0 && i + 1 < argc) {
+      target = std::stod(argv[++i]);
+      // With a quality target, the iteration count is just a safety cap.
+      if (iters < 100000) iters = 100000;
     }
   }
 
@@ -151,13 +156,17 @@ int main(int argc, char** argv) {
   cudaEventCreate(&t0);
   cudaEventCreate(&t1);
   cudaEventRecord(t0);
-  solver.solve(iters, algo);
+  solver.solve(iters, algo, target);
   cudaEventRecord(t1);
   cudaEventSynchronize(t1);
   float ms = 0.0f;
   cudaEventElapsedTime(&ms, t0, t1);
-  std::fprintf(stderr, "gpu_cfr: %d iters in %.1f ms (%.0f iters/s)\n", iters,
-               ms, iters / (ms / 1000.0f));
+  std::fprintf(stderr, "gpu_cfr: %d iters in %.1f ms (%.0f iters/s)\n",
+               solver.iterationsRun(), ms,
+               solver.iterationsRun() / (ms / 1000.0f));
+  if (target > 0.0)
+    std::fprintf(stderr, "gpu_cfr: target %.4f reached at %d iters\n", target,
+                 solver.iterationsRun());
 
   if (std::getenv("GPU_CFR_DEBUG")) solver.debugDump();
 

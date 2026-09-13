@@ -761,6 +761,61 @@ struct GpuPostflopSolver::Impl {
     }
   }
 
+  // Disjoint weighted pair mass over the base lists (the EV normalizer).
+  double pairMass() const {
+    double Z = 0.0;
+    double total1 = 0.0;
+    double cardSum[52] = {0.0};
+    for (int j = 0; j < n1Base; ++j) {
+      total1 += w1[j];
+      cardSum[baseCards1[2 * j]] += w1[j];
+      cardSum[baseCards1[2 * j + 1]] += w1[j];
+    }
+    for (int i = 0; i < n0Base; ++i) {
+      double w = total1 - cardSum[baseCards0[2 * i]] -
+                 cardSum[baseCards0[2 * i + 1]];
+      int so = sameOther0[i];
+      if (so >= 0) w += w1[so];
+      if (w > 0.0) Z += w0[i] * w;
+    }
+    return Z;
+  }
+
+  // Range-weighted root value for traverser `tr` in the given walk mode
+  // (kModeEV: average strategy; kModeBR: best response), divided by the
+  // disjoint pair mass. Walks only read the regret/strategy rows and
+  // scratch, so they are safe to interleave with CFR graph replays.
+  double rootValue(int tr, int mode) {
+    cudaStream_t s = stream;
+    halfStep(tr, mode, 1, s);
+    GPU_CHECK(cudaStreamSynchronize(s));
+    const int nBase = tr == 0 ? n0Base : n1Base;
+    std::vector<float> cfv(nBase);
+    GPU_CHECK(cudaMemcpy(cfv.data(), dCfv, (size_t)nBase * sizeof(float),
+                         cudaMemcpyDeviceToHost));
+    // Host accumulation in f64 over the f32 rows.
+    double v = 0.0;
+    for (int i = 0; i < nBase; ++i)
+      v += (double)(tr == 0 ? w0[i] : w1[i]) * (double)cfv[i];
+    const double Z = pairMass();
+    if (Z <= 0.0) return 0.0;
+    if (std::getenv("GPU_CFR_DEBUG") && std::getenv("GPU_CFR_SEED_STRAT") &&
+        tr == 0) {
+      std::fprintf(stderr, "SEEDROOTCFV0:");
+      for (int i = 0; i < n0Base; ++i)
+        std::fprintf(stderr, " %.2f", cfv[i]);
+      std::fprintf(stderr, "\n");
+    }
+    return v / Z;
+  }
+
+  // Current exploitability in chips (two BR walks).
+  double explNow() {
+    const double V0 = rootValue(0, kModeBR);
+    const double V1 = rootValue(1, kModeBR);
+    return (V0 + V1 - (double)pot) / 2.0;
+  }
+
   void free() {
     auto kill = [](auto& p) {
       if (p) {
@@ -1467,8 +1522,10 @@ GpuPostflopSolver::~GpuPostflopSolver() {
   }
 }
 
-void GpuPostflopSolver::solve(int iterations, const std::string& algo) {
+void GpuPostflopSolver::solve(int iterations, const std::string& algo,
+                              double target) {
   Impl* I = impl_;
+  iterationsRun_ = 0;
   if (I->empty) return;
   cudaStream_t s = I->stream;
   // The schedule (powers of t) is computed in double and stored f32;
@@ -1492,10 +1549,26 @@ void GpuPostflopSolver::solve(int iterations, const std::string& algo) {
     GPU_CHECK(cudaStreamEndCapture(s, &I->graph));
     I->capturing = false;
     GPU_CHECK(cudaGraphInstantiate(&I->exec, I->graph, nullptr, nullptr, 0));
-    for (int t = 0; t < iterations; ++t) {
-      GPU_CHECK(cudaGraphLaunch(I->exec, s));
+    // Replay in chunks; with a target set, check the exploitability
+    // (two BR walks, ~4 iteration-equivalents) after each chunk and
+    // stop early once it crosses the target. The walks never touch the
+    // CFR rows, so resuming replays is sound.
+    const int chunk = 128;
+    int done = 0;
+    while (done < iterations) {
+      const int n = std::min(chunk, iterations - done);
+      for (int t = 0; t < n; ++t) GPU_CHECK(cudaGraphLaunch(I->exec, s));
+      done += n;
+      iterationsRun_ = done;
+      if (target > 0.0 && done < iterations && I->explNow() <= target) {
+        iterationsRun_ = done;
+        break;
+      }
+      iterationsRun_ = done;
     }
     GPU_CHECK(cudaStreamSynchronize(s));
+  } else {
+    iterationsRun_ = 0;
   }
 }
 
@@ -1525,7 +1598,6 @@ pf::NodeStats GpuPostflopSolver::stats() {
   }
   if (Z <= 0.0) return st;
 
-  std::vector<float> rootCfvF(std::max(I->n0Base, I->n1Base));
   // Debug: seed the average-strategy rows with a deterministic non-
   // uniform profile to test the value-walk invariant independent of
   // training. GPU_CFR_SEED_STRAT: 1 = all decide nodes; 2 = turn-level
@@ -1562,31 +1634,10 @@ pf::NodeStats GpuPostflopSolver::stats() {
                          cudaMemcpyHostToDevice));
     std::fprintf(stderr, "seeded strat rows (mode %d)\n", seedMode);
   }
-  auto passRootValue = [&](int tr, int mode) {
-    I->halfStep(tr, mode, 1, s);
-    GPU_CHECK(cudaStreamSynchronize(s));
-    const int nBase = tr == 0 ? I->n0Base : I->n1Base;
-    GPU_CHECK(cudaMemcpy(rootCfvF.data(), I->dCfv,
-                         (size_t)nBase * sizeof(float),
-                         cudaMemcpyDeviceToHost));
-    // Host walk accumulates in double: the reported EV/exploitability
-    // keep f64 precision over the f32 rows.
-    double v = 0.0;
-    for (int i = 0; i < nBase; ++i)
-      v += (double)(tr == 0 ? I->w0[i] : I->w1[i]) * (double)rootCfvF[i];
-    if (std::getenv("GPU_CFR_DEBUG") && tr == 0 && std::getenv("GPU_CFR_SEED_STRAT")) {
-      std::fprintf(stderr, "SEEDROOTCFV0:");
-      for (int i = 0; i < I->n0Base; ++i)
-        std::fprintf(stderr, " %.2f", rootCfvF[i]);
-      std::fprintf(stderr, "\n");
-    }
-    return v / Z;
-  };
-
-  double ev0 = passRootValue(0, kModeEV);
-  double ev1 = passRootValue(1, kModeEV);
-  double V0 = passRootValue(0, kModeBR);
-  double V1 = passRootValue(1, kModeBR);
+  double ev0 = I->rootValue(0, kModeEV);
+  double ev1 = I->rootValue(1, kModeEV);
+  double V0 = I->rootValue(0, kModeBR);
+  double V1 = I->rootValue(1, kModeBR);
   st.ev0 = ev0;
   st.ev1 = ev1;
   st.expl = (V0 + V1 - (double)I->pot) / 2.0;

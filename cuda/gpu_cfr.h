@@ -49,9 +49,15 @@ class GpuPostflopSolver {
   GpuPostflopSolver(const GpuPostflopSolver&) = delete;
   GpuPostflopSolver& operator=(const GpuPostflopSolver&) = delete;
 
-  // Runs `iterations` DCFR iterations via CUDA graph replay.
-  // algo: "dcfr" or "hs30" (same schedules as the CPU river solver).
-  void solve(int iterations, const std::string& algo);
+  // Runs up to `iterations` DCFR iterations via CUDA graph replay.
+  // algo: "dcfr" or "hs30". If target > 0, the solve stops early once
+  // the exploitability (checked every 128 iterations via two BR walks)
+  // drops to or below it; iterationsRun() reports how many ran.
+  void solve(int iterations, const std::string& algo, double target = -1.0);
+
+  // Iterations executed by the last solve() call (early-stopped counts
+  // included).
+  int iterationsRun() const { return iterationsRun_; }
 
   // Final walks (EV + best response against the average strategy);
   // call after solve().
@@ -71,6 +77,7 @@ class GpuPostflopSolver {
   Impl* impl_ = nullptr;
   int numNodes_ = 0;
   int maxDepth_ = 0;
+  int iterationsRun_ = 0;
 };
 
 }  // namespace gpu
