@@ -13,7 +13,7 @@ SRCS := src/cards.cpp src/common.cpp src/eval.cpp src/fgs.cpp src/hand169.cpp \
 HEADERS := $(wildcard src/*.h)
 BUILD := build
 
-.PHONY: all test verify-pfs stub-bias gpu-quick gpu-parity turn-bench clean
+.PHONY: all test verify-pfs stub-bias gpu-quick gpu-parity turn-bench flop-bench clean
 
 all: $(BUILD)/ppsolve
 
@@ -61,9 +61,13 @@ gpu-quick:
 gpu-parity:
 	tools/quality/gpu_postflop_parity.sh full
 
-# Turn-solver performance tracker (phase breakdown + iters/s).
+# Performance trackers (phase breakdown + iters/s).
 turn-bench:
 	tools/quality/bench_turn.sh
+
+# Flop benchmark: bets 0.4 pot + all-in, raises 2.5x (see bench_flop.sh).
+flop-bench:
+	tools/quality/bench_flop.sh
 
 clean:
 	rm -rf $(BUILD)

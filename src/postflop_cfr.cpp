@@ -46,7 +46,8 @@ std::vector<TreeAction> betActions(int64_t potBase, int64_t stack,
     for (double f : cfg.betFracs) {
       actions.push_back({ActionKind::Bet, roundTo(f * static_cast<double>(pot))});
     }
-    if (maxAmount <= roundTo(cfg.addAllinThreshold * static_cast<double>(pot))) {
+    if (cfg.betAllIn ||
+        maxAmount <= roundTo(cfg.addAllinThreshold * static_cast<double>(pot))) {
       actions.push_back({ActionKind::AllIn, maxAmount});
     }
   } else {

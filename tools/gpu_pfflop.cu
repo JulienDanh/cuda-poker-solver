@@ -67,6 +67,33 @@ std::vector<double> parseDoubles(const std::string& s) {
   return out;
 }
 
+// Bet sizes: comma list of pot fractions, with "a" for an explicit
+// all-in bet (postflop-solver's "a" size; see pf::BetConfig::betAllIn).
+// Returns false if a token is neither numeric nor "a".
+bool parseBetSizes(const std::string& s, pf::BetConfig& cfg,
+                   bool& sawAllIn) {
+  size_t start = 0;
+  while (start <= s.size()) {
+    size_t end = s.find(',', start);
+    std::string tok = end == std::string::npos ? s.substr(start)
+                                               : s.substr(start, end - start);
+    if (!tok.empty()) {
+      if (tok == "a" || tok == "A" || tok == "allin") {
+        sawAllIn = true;
+      } else {
+        try {
+          cfg.betFracs.push_back(std::stod(tok));
+        } catch (...) {
+          return false;
+        }
+      }
+    }
+    if (end == std::string::npos) break;
+    start = end + 1;
+  }
+  return true;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -94,8 +121,13 @@ int main(int argc, char** argv) {
   spot.pot = std::stoll(argv[5]);
   spot.stack = std::stoll(argv[6]);
   pf::BetConfig cfg;
-  cfg.betFracs = parseDoubles(argv[7]);
+  cfg.betFracs.clear();
   cfg.raiseMults = parseDoubles(argv[8]);
+  if (!parseBetSizes(argv[7], cfg, cfg.betAllIn)) {
+    std::fprintf(stderr, "bad bet sizes '%s' (use fractions and/or 'a')\n",
+                 argv[7]);
+    return 2;
+  }
   int iters = std::stoi(argv[9]);
   std::string algo = "dcfr";
   bool rootStrat = false;

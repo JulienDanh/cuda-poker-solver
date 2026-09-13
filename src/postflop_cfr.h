@@ -23,9 +23,12 @@ struct TreeAction {
 
 struct BetConfig {
   // Bet sizes as fractions of the (call-inclusive) pot; raises as
-  // multiples of the previous bet.
+  // multiples of the previous bet. betAllIn adds an explicit all-in bet
+  // to every unopened street (the oracle's "a" size); all-ins near the
+  // stack cap are still auto-added by addAllinThreshold.
   std::vector<double> betFracs = {0.5, 0.75, 1.0};
   std::vector<double> raiseMults = {2.5, 3.0};
+  bool betAllIn = false;
   double addAllinThreshold = 1.5;
   double forceAllinThreshold = 0.15;
   double mergingThreshold = 0.1;
