@@ -2496,6 +2496,193 @@ NodeEv GpuPostflopSolver::nodeEv(int decideIdx) {
   return out;
 }
 
+RunoutSummary GpuPostflopSolver::runoutSummary(int decideIdx,
+                                              int actionIdx) {
+  Impl* I = impl_;
+  RunoutSummary out;
+  if (I->empty) throw std::runtime_error("solver compiled to empty ranges");
+  if (decideIdx < 0 || decideIdx >= (int)I->decideMeta.size())
+    throw std::runtime_error("decide node index " +
+                             std::to_string(decideIdx) + " out of range (" +
+                             std::to_string(I->decideMeta.size()) +
+                             " decide nodes)");
+  const auto& m = I->decideMeta[decideIdx];
+  const int u = m.nodeId;
+  if (actionIdx < 0 || actionIdx >= m.na)
+    throw std::runtime_error("action index " +
+                             std::to_string(actionIdx) + " out of range");
+  const int ch = I->hChildFlat[I->hChildBase[u] + actionIdx];
+  if (I->hKind[ch] != kChance)
+    throw std::runtime_error("action does not lead to a deal");
+  const int numNodes = (int)I->hKind.size();
+  auto childCount = [&](int node) {
+    const int nxt = node + 1 < numNodes ? I->hChildBase[node + 1]
+                                       : (int)I->hChildFlat.size();
+    return nxt - I->hChildBase[node];
+  };
+  const int nb = childCount(ch);
+  const int nChanceBoard = 52 - nb;  // nBranch = 52 - nBoard
+
+  // node id -> decide-meta position
+  std::vector<int> metaOf(numNodes, -1);
+  for (size_t i = 0; i < I->decideMeta.size(); ++i)
+    metaOf[I->decideMeta[i].nodeId] = (int)i;
+
+  // First decide node per branch (BFS through further deals). The
+  // branch child itself is usually the decide node (the new street's
+  // first decision) — check it before descending.
+  auto firstDecide = [&](int start) {
+    if (I->hKind[start] == kDecide) return start;
+    std::vector<int> q{start};
+    size_t qi = 0;
+    while (qi < q.size()) {
+      const int x = q[qi++];
+      const int cnt = childCount(x);
+      for (int i = 0; i < cnt; ++i) {
+        const int c = I->hChildFlat[I->hChildBase[x] + i];
+        if (I->hKind[c] == kDecide) return c;
+        if (I->hKind[c] == kChance) q.push_back(c);
+      }
+    }
+    return -1;
+  };
+
+  out.branches.resize(nb);
+  int firstIdx = -1;
+  for (int br = 0; br < nb; ++br) {
+    const int bc = I->hChildFlat[I->hChildBase[ch] + br];
+    // the dealt card: diff by board LENGTH (card id 0 is the 2c)
+    std::vector<uint8_t> pb(I->hNodeBoard.begin() + 5 * ch,
+                            I->hNodeBoard.begin() + 5 * ch + nChanceBoard);
+    std::vector<uint8_t> cb(I->hNodeBoard.begin() + 5 * bc,
+                            I->hNodeBoard.begin() + 5 * bc + nChanceBoard + 1);
+    for (uint8_t c : pb) {
+      auto it = std::find(cb.begin(), cb.end(), c);
+      if (it != cb.end()) cb.erase(it);
+    }
+    out.branches[br].card = cb.size() == 1 ? cb[0] : -1;
+    const int fd = firstDecide(bc);
+    if (fd >= 0) {
+      out.branches[br].nextDecide = metaOf[fd];
+      if (firstIdx < 0) firstIdx = metaOf[fd];
+    }
+  }
+  if (firstIdx < 0) return out;  // every runout ends at showdown
+  const auto& fm = I->decideMeta[firstIdx];
+  out.decider = fm.player;
+  for (int a = 0; a < fm.na; ++a) {
+    const pf::TreeAction& act = I->actFlat[fm.actBase + a];
+    out.actions.push_back({act.kind, act.amount});
+  }
+
+  // One EV walk per player serves ALL branches; per branch we read
+  // its first decide node's cfv row (mass x EV) and the reach row.
+  // Layout tr holds player (1-tr)'s reach, so one row gives tr's mass
+  // (opponent reach) AND the decider's own reach when tr != decider.
+  for (int tr = 0; tr < 2; ++tr) {
+    I->halfStep(tr, kModeEV, 1, I->stream);
+    GPU_CHECK(cudaStreamSynchronize(I->stream));
+    const std::vector<uint8_t>& cSelf =
+        tr == 0 ? I->baseCards0 : I->baseCards1;
+    const std::vector<uint8_t>& cOpp =
+        tr == 0 ? I->baseCards1 : I->baseCards0;
+    const std::vector<int>& sameOther =
+        tr == 0 ? I->sameOther0 : I->sameOther1;
+    const std::vector<double>& wSelf = tr == 0 ? I->w0 : I->w1;
+    for (int br = 0; br < nb; ++br) {
+      const int bi = out.branches[br].nextDecide;
+      if (bi < 0) continue;
+      const auto& bm = I->decideMeta[bi];
+      const int fnode = bm.nodeId;
+      const int nC = tr == 0 ? I->hNC0[fnode] : I->hNC1[fnode];
+      const int nOpp = tr == 0 ? I->hNC1[fnode] : I->hNC0[fnode];
+      const int offC = tr == 0 ? I->hComboOff0[fnode] : I->hComboOff1[fnode];
+      const int offOpp =
+          tr == 0 ? I->hComboOff1[fnode] : I->hComboOff0[fnode];
+      std::vector<int> combos(I->hComboId.begin() + offC,
+                              I->hComboId.begin() + offC + nC);
+      // the reach row: layout tr at fnode, indexed by (1-tr)'s slots
+      const int reachOff =
+          tr == 0 ? I->hReachOff0[fnode] : I->hReachOff1[fnode];
+      std::vector<float> reach(nOpp);
+      GPU_CHECK(cudaMemcpy(reach.data(),
+                           (tr == 0 ? I->dReach0 : I->dReach1) +
+                               (size_t)reachOff,
+                           (size_t)nOpp * sizeof(float),
+                           cudaMemcpyDeviceToHost));
+      double cardSum[52] = {0.0};
+      double tot = 0.0;
+      for (int j = 0; j < nOpp; ++j) {
+        tot += reach[j];
+        const int base = I->hComboId[offOpp + j];
+        cardSum[cOpp[2 * base]] += reach[j];
+        cardSum[cOpp[2 * base + 1]] += reach[j];
+      }
+      auto localSlot = [&](int base) {
+        int lo = 0, hi = nOpp;
+        while (lo < hi) {
+          const int mid = (lo + hi) / 2;
+          if (I->hComboId[offOpp + mid] < base) lo = mid + 1;
+          else hi = mid;
+        }
+        return (lo < nOpp && I->hComboId[offOpp + lo] == base) ? lo : -1;
+      };
+      std::vector<double> mass(nC, 0.0);
+      for (int i = 0; i < nC; ++i) {
+        const int base = combos[i];
+        double mm = tot - cardSum[cSelf[2 * base]] -
+                    cardSum[cSelf[2 * base + 1]];
+        const int so = sameOther[base];
+        if (so >= 0) {
+          const int slot = localSlot(so);
+          if (slot >= 0) mm += reach[slot];
+        }
+        mass[i] = mm;
+      }
+      // tr's EV at the branch node (range x mass weighted)
+      std::vector<float> row(nC);
+      GPU_CHECK(cudaMemcpy(row.data(),
+                           I->dCfv + (size_t)I->hCfvOff[fnode],
+                           (size_t)nC * sizeof(float),
+                           cudaMemcpyDeviceToHost));
+      double num = 0.0, den = 0.0;
+      for (int i = 0; i < nC; ++i) {
+        if (mass[i] <= 0.0) continue;
+        const double wt = wSelf[combos[i]] * mass[i];
+        num += wt * (double)row[i] / mass[i];
+        den += wt;
+      }
+      out.branches[br].aggEv[tr] = den > 0.0 ? num / den : 0.0;
+      // when this walk's reach row is the DECIDER's own reach
+      // (layout tr = (1-tr)'s reach; decider == 1-tr), aggregate the
+      // decider's strategy over it
+      if (bm.player != tr && bm.na == (int)out.actions.size()) {
+        const int nDec = nOpp;  // the row is the decider's combos
+        std::vector<float> srows((size_t)bm.na * nDec);
+        GPU_CHECK(cudaMemcpy(srows.data(),
+                             I->dStrat + (size_t)bm.regOff,
+                             (size_t)bm.na * nDec * sizeof(float),
+                             cudaMemcpyDeviceToHost));
+        std::vector<double>& freq = out.branches[br].freq;
+        freq.assign(bm.na, 0.0);
+        double z = 0.0;
+        for (int c = 0; c < nDec; ++c) {
+          double s = 0.0;
+          for (int a = 0; a < bm.na; ++a)
+            s += srows[(size_t)a * nDec + c];
+          if (s <= 0.0) continue;
+          z += reach[c];
+          for (int a = 0; a < bm.na; ++a)
+            freq[a] += reach[c] * (double)srows[(size_t)a * nDec + c] / s;
+        }
+        if (z > 0.0)
+          for (int a = 0; a < bm.na; ++a) freq[a] /= z;
+      }
+    }
+  }
+  return out;
+}
+
 // Solution files: self-describing, little-endian. The tree layout is a
 // deterministic function of (spot, bet config), so only the spot, the
 // config, the schedule state and the two row tables are stored; the

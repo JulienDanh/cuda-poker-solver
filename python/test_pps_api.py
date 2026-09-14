@@ -195,7 +195,8 @@ def test_ui_and_paths():
 
 def test_runout_branches():
     # a flop spot: the check-check deal enumerates all turn runouts
-    r = check(client.post("/solvers", json={**SPOT, "board": "Qs9h2d"}), 201)
+    r = check(client.post("/solvers", json={**SPOT, "board": "Qs9h2d"}),
+              201)
     sid = r["id"]
     check(client.post(f"/solvers/{sid}/solve", json={"max_iters": 100}))
     nav = check(client.get(f"/solvers/{sid}/node-nav?node=1"))
@@ -215,6 +216,31 @@ def test_runout_branches():
     some = next(b for b in br if b["next_decide"] is not None)
     ev = check(client.get(f"/solvers/{sid}/node-ev?node={some['next_decide']}"))
     assert ev["sides"]["oop"]["cards"]
+
+    # the runout summary: per-card first-action frequencies + EVs
+    rs = check(client.get(
+        f"/solvers/{sid}/runout-summary?node=1&action=0"))
+    assert rs["decider"] == 0  # OOP acts first on the new street
+    assert len(rs["branches"]) == 49
+    live = [b for b in rs["branches"] if b["next_decide"] >= 0]
+    assert len(live) == 49
+    for b in live:
+        f = b["freq"]
+        assert len(f) == len(rs["actions"])
+        assert abs(sum(f) - 1.0) < 1e-5, sum(f)
+        assert b["agg_ev"]["oop"] == b["agg_ev"]["oop"]
+    # the summary's cards match the nav branches
+    assert [b["card"] for b in rs["branches"]] == cards
+    # consistency: a branch's EV must match node-ev at that branch node
+    first_b = live[0]
+    nev = check(client.get(
+        f"/solvers/{sid}/node-ev?node={first_b['next_decide']}")
+    )
+    assert abs(nev["sides"]["oop"]["agg_ev"] -
+               first_b["agg_ev"]["oop"]) < 1e-3
+    # non-deal action rejected
+    check(client.get(f"/solvers/{sid}/runout-summary?node=0&action=0"),
+          400)
     check(client.delete(f"/solvers/{sid}"))
 
 

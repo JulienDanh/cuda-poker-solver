@@ -124,9 +124,14 @@ button:disabled { opacity: .45; cursor: default; }
 .evchip.p1 { color: #9fd0ff; }
 #runout-strip { margin-top: 10px; }
 .runoutgrid {
-  display: grid; grid-template-columns: repeat(auto-fill, minmax(38px, 1fr));
+  display: grid; grid-template-columns: repeat(auto-fill, minmax(46px, 1fr));
   gap: 4px; max-width: 640px;
 }
+.runcell { cursor: pointer; }
+.runcell .pk { width: 100%; }
+.runbar { height: 5px; border-radius: 3px; margin-top: 2px;
+  background: #0d1016; overflow: hidden; }
+.runcell:hover .pk { border-color: var(--accent); }
 
 /* ---- stats ---- */
 .stats { display: flex; flex-wrap: wrap; gap: 20px; }

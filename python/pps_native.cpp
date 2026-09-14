@@ -424,6 +424,36 @@ class Solver {
     return out;
   }
 
+  // Per-runout summary through a deal edge: for each dealt card, the
+  // branch's first decide node with reach-weighted frequencies and
+  // both players' EVs.
+  py::dict runoutSummary(int decideIdx, int actionIdx) {
+    pps::gpu::RunoutSummary rs;
+    {
+      py::gil_scoped_release rel;
+      rs = solver_->runoutSummary(decideIdx, actionIdx);
+    }
+    py::dict out;
+    out["decider"] = rs.decider;
+    py::list acts;
+    for (const auto& a : rs.actions) acts.append(actionDict(a));
+    out["actions"] = acts;
+    py::list brs;
+    for (const auto& b : rs.branches) {
+      py::dict d;
+      d["card"] = b.card >= 0 ? cardText((uint8_t)b.card) : "?";
+      d["next_decide"] = b.nextDecide;
+      d["freq"] = toArray(b.freq);
+      py::dict evs;
+      evs["oop"] = b.aggEv[0];
+      evs["ip"] = b.aggEv[1];
+      d["agg_ev"] = evs;
+      brs.append(d);
+    }
+    out["branches"] = brs;
+    return out;
+  }
+
   void save(const std::string& path) const {
     py::gil_scoped_release rel;
     solver_->save(path);
@@ -508,6 +538,8 @@ PYBIND11_MODULE(pps_native, m) {
       .def("strategy", &Solver::strategy, py::arg("decide_idx") = 0)
       .def("root_ev", &Solver::rootEv)
       .def("node_ev", &Solver::nodeEv, py::arg("decide_idx") = 0)
+      .def("runout_summary", &Solver::runoutSummary, py::arg("decide_idx"),
+           py::arg("action_idx"))
       .def("save", &Solver::save, py::arg("path"))
       .def("player_cards", &Solver::playerCardsList, py::arg("player"))
       .def("player_weights", &Solver::playerWeightsArr, py::arg("player"))

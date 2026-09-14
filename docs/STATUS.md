@@ -312,6 +312,26 @@ after each step):
     collisions, card-id-0 deal, branch navigation lands on a turn
     decide node). Perf-loop + quick gate green; live-verified.
 
+20. **Runout summaries (the GTO per-card study view)**: new engine
+    method `runoutSummary(node, action)` — through a deal edge, per
+    dealt card: the branch's first decide node, the acting player's
+    reach-weighted average frequencies on the new street, and both
+    players' EVs there. ONE value walk per player serves ALL 49
+    branches (each node's cfv row = mass x EV after that walk); the
+    same reach row read gives the traverser's mass (opponent reach)
+    and, in the other walk, the decider's own reach for the strategy
+    weighting. Found and fixed a BFS bug during verification: the
+    branch child itself is the decide node — skipping it reported
+    IP (the response node) as the turn's first actor instead of OOP.
+    The API exposes /runout-summary and the runout picker now shows
+    each card with its stacked first-action bar (hover: full strategy
+    breakdown + per-player EVs). Cross-gated: a branch's summary EV
+    equals nodeEv() computed independently at that node (< 1e-3),
+    frequencies sum to 1, all 49 cards distinct and board-disjoint.
+    One perf-loop flag on the standard spot (x0.937) investigated and
+    cleared as noise: three re-runs span 4785-5288 it/s (~10% band,
+    no kernel changes this round); loop re-run green.
+
 Cumulative turn throughput: ~4.0x (wide 193 -> ~785, standard 1401 ->
 ~4,730, shortstack 96 -> ~87 us/iter); practical flop 56 -> ~58
 iters/s (1500 stack) and 201 -> ~211 (500 stack).

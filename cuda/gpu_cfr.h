@@ -122,6 +122,22 @@ struct NodeEv {
   Side side[2];
 };
 
+// Summary of every runout through a deal edge: per dealt card, the
+// first decide node's reach-weighted average strategy (the acting
+// player's frequencies on the new street) and both players' EVs
+// there. Computed with ONE value walk per player for all branches.
+struct RunoutSummary {
+  struct Branch {
+    int card = 0;               // dealt card id (suit*13 + rank)
+    int nextDecide = -1;        // decide index; -1: runout to showdown
+    std::vector<double> freq;   // decider's reach-weighted frequencies
+    double aggEv[2] = {0.0, 0.0};  // both players' EVs at the branch node
+  };
+  int decider = 0;              // the acting player on the dealt street
+  std::vector<ActionLabel> actions;  // the decider's actions there
+  std::vector<Branch> branches;
+};
+
 class GpuPostflopSolver {
  public:
   // Compiles the spot to device dataflow (tree build + upload).
@@ -198,6 +214,12 @@ class GpuPostflopSolver {
   // value walk per player), plus the deciding player's per-action
   // EVs. Runs two full-tree EV walks.
   NodeEv nodeEv(int decideIdx);
+
+  // Per-runout summaries through the deal edge of decide node
+  // `decideIdx`, action `actionIdx` (the child must be a chance
+  // node): for each dealt card, the branch's first decide node with
+  // its reach-weighted strategy frequencies and both players' EVs.
+  RunoutSummary runoutSummary(int decideIdx, int actionIdx);
 
   // The base combo lists the solver was compiled with: cards[2*i],
   // cards[2*i+1] is combo slot i of player p's range (board-filtered,

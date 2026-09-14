@@ -571,6 +571,19 @@ def solver_node_ev(sid: str, node: int = Query(0, ge=0)) -> Dict[str, Any]:
     return _jsonable(ev)
 
 
+@app.get("/solvers/{sid}/runout-summary")
+def solver_runout_summary(sid: str, node: int = Query(0, ge=0),
+                          action: int = Query(0, ge=0)) -> Dict[str, Any]:
+    """Per-runout summary through the deal edge of decide node `node`,
+    action `action`: for each dealt card, the branch's first decision
+    with the acting player's reach-weighted frequencies and both
+    players' EVs there."""
+    e = REGISTRY.get(sid)
+    with e.lock:
+        rs = _engine(e.solver.runout_summary, node, action)
+    return _jsonable(rs)
+
+
 @app.post("/solvers/{sid}/save")
 def solver_save(sid: str, p: SaveParams) -> Dict[str, Any]:
     e = REGISTRY.get(sid)

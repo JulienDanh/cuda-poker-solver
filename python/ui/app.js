@@ -378,29 +378,67 @@ function renderSpot(nav) {
     }
     b.innerHTML = `${a.label}<small>${parts.join(" · ")}</small>`;
     if (a.branches && a.branches.some((x) => x.next_decide != null)) {
-      // deal edge: show the runout picker instead of jumping to an
-      // arbitrary first branch
+      // deal edge: show the runout picker with per-card strategy and
+      // EV summaries instead of jumping to an arbitrary first branch
       b.disabled = false;
-      b.onclick = () => {
+      b.onclick = async () => {
+        let rs = null;
+        try {
+          rs = await api("GET",
+            `/solvers/${active}/runout-summary?node=${currentNode}&action=${i}`);
+        } catch (e) { /* summary is best-effort */ }
         const strip = document.createElement("div");
         strip.className = "runoutgrid";
-        a.branches.forEach((br) => {
+        const branches = rs ? rs.branches : a.branches;
+        const rActs = rs ? rs.actions : null;
+        const colors = rActs ? rActs.map((ra, ri) => {
+          const kIdx = rActs.filter((x, j) => x.kind === ra.kind && j <= ri).length - 1;
+          return kindColor(ra.kind, Math.max(0, kIdx));
+        }) : [];
+        branches.forEach((br) => {
+          const cell = document.createElement("div");
+          cell.className = "runcell";
           const rc = document.createElement("div");
-          rc.className = "pk " + clsOf(br.card) + (br.next_decide == null ? " used" : "");
+          rc.className = "pk " + clsOf(br.card) +
+            (br.next_decide == null ? " used" : "");
           rc.textContent = br.card;
-          rc.title = br.next_decide == null ? "runout to showdown" :
-            "deal " + br.card;
+          cell.appendChild(rc);
+          if (rs && br.freq && br.freq.length) {
+            // stacked strategy bar under the card
+            const stops = [];
+            let acc = 0;
+            br.freq.forEach((f, fi) => {
+              if (f <= 0.001) return;
+              stops.push(`${colors[fi]} ${acc * 100}% ${(acc + f) * 100}%`);
+              acc += f;
+            });
+            const bar = document.createElement("div");
+            bar.className = "runbar";
+            bar.style.background = stops.length
+              ? `linear-gradient(90deg, ${stops.join(",")})` : "#0d1016";
+            cell.appendChild(bar);
+            rc.title = `${br.card}: ` +
+              rActs.map((ra, ri) =>
+                `${ra.kind}${ra.amount ? " " + ra.amount : ""} ` +
+                `${(br.freq[ri] * 100).toFixed(1)}%`).join(" | ") +
+              ` — EV OOP ${br.agg_ev.oop.toFixed(1)} / IP ${br.agg_ev.ip.toFixed(1)}`;
+          } else {
+            rc.title = br.next_decide == null
+              ? "runout to showdown" : "deal " + br.card;
+          }
           if (br.next_decide != null) {
-            rc.onclick = () => {
-              const who = currentStrategy ? currentStrategy.player : 0;
+            cell.onclick = () => {
               selectNode(br.next_decide,
                 { node: br.next_decide, label: br.card, card: br.card,
                   who: null });
             };
           }
-          strip.appendChild(rc);
+          strip.appendChild(cell);
         });
-        runouts.innerHTML = `<div class="dim">runouts after ${a.label} — click a card:</div>`;
+        runouts.innerHTML = `<div class="dim">runouts after ${a.label}` +
+          (rs ? ` — ${rs.decider === 0 ? "OOP" : "IP"} acts first; ` +
+           "bar = first action; hover a card for the breakdown" : "") +
+          ":</div>";
         runouts.appendChild(strip);
       };
     } else {
