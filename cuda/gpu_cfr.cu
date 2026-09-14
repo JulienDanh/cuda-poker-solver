@@ -145,7 +145,11 @@ struct TreeBuf {
   const int* comboOff0;  // offsets into comboId
   const int* comboOff1;
   const int* comboId;    // base slots (per side) per node combo
-  const int* reachOff;   // per node slot offset in reach/cfv
+  const int* reachOff;  // per node slot offset in the traverser's
+                         // reach layout (aliased; see the compile)
+  const int* cfvOff;    // per node dense slot offset in cfv (never
+                         // aliased: children of a pass-through node
+                         // still produce distinct cfv rows)
   const int64_t* sc0;
   const int64_t* sc1;
   const int64_t* potBase;
@@ -166,9 +170,7 @@ struct TreeBuf {
   const int* expOff;     // per (node, p): CSR offsets over parent slots
   const int* expIdx;     // packed (branch * 4096 + childSlot)
   const int* expIdxBase;  // per node: this node's entries' start in expIdx
-  // range weights / base cards / identity map (base space)
-  const float* w0;
-  const float* w1;
+  // base cards / identity map (base space)
   const uint8_t* cards0;
   const uint8_t* cards1;
   const int* sameOther0;  // base slot side0 -> base slot side1 (or -1)
@@ -224,20 +226,15 @@ __device__ __forceinline__ void fwdDecideBlock(int node, int c, int tr,
   const int opp = 1 - tr;
   const int nOppNode = nOfP(b, node, opp);
   if (c >= nOppNode) return;
-  const int comboOff = comboOffP(b, node, opp);
-  const int baseId = b.comboId[comboOff + c];
   const int p = b.player[node];
+  // Pass-through (traverser acts): every child's reach row is identical
+  // to this node's row, so the layout ALIASES it (the children's
+  // reachOff[tr] points here) — nothing to write. The root's row is
+  // initialized at compile from the range weights (w_opp into layout tr),
+  // so the plain row read covers node 0 too.
+  if (p == tr) return;
   const int na = b.na[node];
-  const float r =
-      node == 0 ? (opp == 0 ? b.w0[baseId] : b.w1[baseId])
-                : b.reach[(size_t)b.reachOff[node] + c];
-  if (p == tr) {
-    for (int a = 0; a < na; ++a) {
-      const int ch = childOf(b, node, a);
-      b.reachRW[(size_t)b.reachOff[ch] + c] = r;
-    }
-    return;
-  }
+  const float r = b.reach[(size_t)b.reachOff[node] + c];
   const float* src = sigSrc == 0 ? b.regret : b.strat;
   const int* off = sigSrc == 0 ? b.regOff : b.strOff;
   const size_t base = (size_t)off[node];
@@ -366,7 +363,7 @@ __device__ void showdownNode(int node, int tr, TreeBuf b,
   const uint8_t* cardsOpp = opp == 0 ? b.cards0 : b.cards1;
   const int nTrNode = nOfP(b, node, tr);
   const int trComboOff = comboOffP(b, node, tr);
-  float* out = b.cfvRW + (size_t)b.reachOff[node];
+  float* out = b.cfvRW + (size_t)b.cfvOff[node];
   for (int i = threadIdx.x; i < nTrNode; i += blockDim.x) {
     const int baseId = b.comboId[trComboOff + i];
     const int le = lessEnd[baseId];
@@ -442,7 +439,7 @@ __device__ void foldNode(int node, int tr, TreeBuf b) {
   const int* son =
       b.foldSon + b.foldSonOff[node] + (tr == 0 ? 0 : nOfP(b, node, 0));
   const int trComboOff = comboOffP(b, node, tr);
-  float* out = b.cfvRW + (size_t)b.reachOff[node];
+  float* out = b.cfvRW + (size_t)b.cfvOff[node];
   for (int i = threadIdx.x; i < nTrNode; i += blockDim.x) {
     const int baseId = b.comboId[trComboOff + i];
     float w = tot - cardSum[cardsTr[2 * baseId]] -
@@ -469,9 +466,9 @@ __device__ void decideNode(int node, int tr, int mode,
       float v = 0.0f;
       for (int a = 0; a < na; ++a) {
         const int ch = childOf(b, node, a);
-        v += b.cfv[(size_t)b.reachOff[ch] + c];
+        v += b.cfv[(size_t)b.cfvOff[ch] + c];
       }
-      b.cfvRW[(size_t)b.reachOff[node] + c] = v;
+      b.cfvRW[(size_t)b.cfvOff[node] + c] = v;
       continue;
     }
     float val = 0.0f;
@@ -496,18 +493,18 @@ __device__ void decideNode(int node, int tr, int mode,
           s = acc > 0.0f ? x / acc : uniform;
         sig[a] = s;
         const int ch = childOf(b, node, a);
-        val += s * b.cfv[(size_t)b.reachOff[ch] + c];
+        val += s * b.cfv[(size_t)b.cfvOff[ch] + c];
       }
     } else {
       float best = -1e30f;
       for (int a = 0; a < na; ++a) {
         const int ch = childOf(b, node, a);
-        float v = b.cfv[(size_t)b.reachOff[ch] + c];
+        float v = b.cfv[(size_t)b.cfvOff[ch] + c];
         if (v > best) best = v;
       }
       val = best;
     }
-    b.cfvRW[(size_t)b.reachOff[node] + c] = val;
+    b.cfvRW[(size_t)b.cfvOff[node] + c] = val;
     if (mode != kModeCFR) continue;
     const float* dCoef = coefTab + (size_t)(*counter) * 3;
     float* rreg = b.regretRW + base;
@@ -515,7 +512,7 @@ __device__ void decideNode(int node, int tr, int mode,
     const float posC = dCoef[0], negC = dCoef[1], avgC = dCoef[2];
     for (int a = 0; a < na; ++a) {
       const int ch = childOf(b, node, a);
-      const float av = b.cfv[(size_t)b.reachOff[ch] + c];
+      const float av = b.cfv[(size_t)b.cfvOff[ch] + c];
       const float r0 = rreg[(size_t)a * nTr + c];
       sst[(size_t)a * nTr + c] = sst[(size_t)a * nTr + c] * avgC + sig[a];
       rreg[(size_t)a * nTr + c] =
@@ -538,7 +535,7 @@ __device__ void chanceNodeBwd(int node, int tr, TreeBuf b) {
   const int p0Total = b.expOff[b.expOffOff[node] + nOfP(b, node, 0)];
   const int idxBase =
       b.expIdxBase[node] + (tr == 0 ? 0 : p0Total);
-  float* out = b.cfvRW + (size_t)b.reachOff[node];
+  float* out = b.cfvRW + (size_t)b.cfvOff[node];
   for (int i = threadIdx.x; i < nTr; i += blockDim.x) {
     const int start = b.expOff[expBase + i];
     const int end = b.expOff[expBase + i + 1];
@@ -548,7 +545,7 @@ __device__ void chanceNodeBwd(int node, int tr, TreeBuf b) {
       const int br = packed / 4096;
       const int js = packed % 4096;
       const int child = childOf(b, node, br);
-      v += b.cfv[(size_t)b.reachOff[child] + js];
+      v += b.cfv[(size_t)b.cfvOff[child] + js];
     }
     out[i] = v;
   }
@@ -626,7 +623,8 @@ struct GpuPostflopSolver::Impl {
   int numNodes = 0, maxDepth = 0;
   int n0Base = 0, n1Base = 0, maxNa = 1;
   int spotNBoard = 0;
-  size_t reachTotal = 0, regTotal = 0;
+  size_t reachTotal = 0, regTotal = 0;  // cfv / regret row totals
+  size_t reachTotal0 = 0, reachTotal1 = 0;  // reach layouts
   int64_t pot = 0;
   bool empty = false;
 
@@ -642,11 +640,14 @@ struct GpuPostflopSolver::Impl {
   int* dComboOff0 = nullptr;
   int* dComboOff1 = nullptr;
   int* dComboId = nullptr;
-  int* dReachOff = nullptr;
+  int* dReachOff0 = nullptr;
+  int* dReachOff1 = nullptr;
+  int* dCfvOff = nullptr;
   int64_t* dSc0 = nullptr;
   int64_t* dSc1 = nullptr;
   int64_t* dPotBase = nullptr;
-  float* dReach = nullptr;
+  float* dReach0 = nullptr;
+  float* dReach1 = nullptr;
   float* dCfv = nullptr;
   float* dRegret = nullptr;
   float* dStrat = nullptr;
@@ -731,12 +732,15 @@ struct GpuPostflopSolver::Impl {
     b.comboOff0 = dComboOff0;
     b.comboOff1 = dComboOff1;
     b.comboId = dComboId;
-    b.reachOff = dReachOff;
     b.sc0 = dSc0;
     b.sc1 = dSc1;
     b.potBase = dPotBase;
-    b.reach = dReach;
-    b.reachRW = dReach;
+    // Defaults (layout 0); halfStep re-points reach/reachRW/reachOff at
+    // the traverser's layout before launching.
+    b.reachOff = dReachOff0;
+    b.cfvOff = dCfvOff;
+    b.reach = dReach0;
+    b.reachRW = dReach0;
     b.cfv = dCfv;
     b.cfvRW = dCfv;
     b.nBranch = dNBranch;
@@ -751,8 +755,6 @@ struct GpuPostflopSolver::Impl {
     b.expIdxBase = dExpIdxBase;
     b.expOff = dExpOff;
     b.expIdx = dExpIdx;
-    b.w0 = dW0;
-    b.w1 = dW1;
     b.cards0 = dCards0;
     b.cards1 = dCards1;
     b.sameOther0 = dSameOther0;
@@ -775,7 +777,11 @@ struct GpuPostflopSolver::Impl {
   }
 
   void halfStep(int tr, int mode, int sigSrc, cudaStream_t s) {
-    const TreeBuf b = buf();
+    TreeBuf b = buf();
+    // Reach rows live in per-traverser layouts (pass-through aliasing).
+    b.reachOff = tr == 0 ? dReachOff0 : dReachOff1;
+    b.reach = tr == 0 ? dReach0 : dReach1;
+    b.reachRW = tr == 0 ? dReach0 : dReach1;
     const float* coefTab = mode == kModeCFR ? dCoefTab : dCoefDummy;
     const int* counter = mode == kModeCFR ? dCounter : dCounterDummy;
     const int maxBase = std::max(n0Base, n1Base);
@@ -877,11 +883,14 @@ struct GpuPostflopSolver::Impl {
     kill(dComboOff0);
     kill(dComboOff1);
     kill(dComboId);
-    kill(dReachOff);
+    kill(dReachOff0);
+    kill(dReachOff1);
+    kill(dCfvOff);
     kill(dSc0);
     kill(dSc1);
     kill(dPotBase);
-    kill(dReach);
+    kill(dReach0);
+    kill(dReach1);
     kill(dCfv);
     kill(dRegret);
     kill(dStrat);
@@ -1295,10 +1304,14 @@ GpuPostflopSolver::GpuPostflopSolver(const PostflopSpot& spot,
   // Flatten the per-node children now that the tree is complete:
   // childBase must index each node's OWN slice, which is only possible
   // once no further interleaved pushes can happen.
+  std::vector<int> parentOf(cc.nodes.size(), -1);
   for (int u = 0; u < (int)cc.nodes.size(); ++u) {
     NodeH& nd = cc.nodes[u];
     nd.childBase = (int)cc.childFlat.size();
-    for (int ch : nd.children) cc.childFlat.push_back(ch);
+    for (int ch : nd.children) {
+      cc.childFlat.push_back(ch);
+      parentOf[ch] = u;
+    }
   }
 
 
@@ -1380,7 +1393,7 @@ GpuPostflopSolver::GpuPostflopSolver(const PostflopSpot& spot,
     vexpIdxBase.push_back(nd.expIdxBase);
     vctapBase.push_back(nd.ctapBase);
     vreachOff.push_back((int)reachTotal);
-    reachTotal += (size_t)std::max(nd.nC0, nd.nC1);
+    reachTotal += (size_t)std::max(nd.nC0, nd.nC1);  // cfv rows stay dense
     if (nd.kind == kDecide) {
       const int nTr = nd.player == 0 ? nd.nC0 : nd.nC1;
       vregOff.push_back((int)regTotal);
@@ -1390,6 +1403,38 @@ GpuPostflopSolver::GpuPostflopSolver(const PostflopSpot& spot,
       vregOff.push_back(0);
     }
   }
+  // Per-traverser reach row layouts with pass-through aliasing: when a
+  // decide node's player == tr, its forward pass would copy the row
+  // unchanged to every child — so the children's rows ALIAS the node's
+  // row and the copy disappears. Rows only change where the opponent
+  // acts (sigma-masked) or a chance node compacts. The root row of
+  // layout tr is initialized with the OPPONENT side's range weights.
+  std::vector<int> vreachOff0(I->numNodes), vreachOff1(I->numNodes);
+  for (int u = 0; u < I->numNodes; ++u) {
+    const NodeH& nd = cc.nodes[u];
+    const int par = parentOf[u];
+    const size_t row = (size_t)std::max(nd.nC0, nd.nC1);
+    const bool alias0 =
+        par >= 0 && cc.nodes[par].kind == kDecide &&
+        cc.nodes[par].player == 0;
+    const bool alias1 =
+        par >= 0 && cc.nodes[par].kind == kDecide &&
+        cc.nodes[par].player == 1;
+    if (alias0)
+      vreachOff0[u] = vreachOff0[par];
+    else {
+      vreachOff0[u] = (int)I->reachTotal0;
+      I->reachTotal0 += row;
+    }
+    if (alias1)
+      vreachOff1[u] = vreachOff1[par];
+    else {
+      vreachOff1[u] = (int)I->reachTotal1;
+      I->reachTotal1 += row;
+    }
+  }
+  upload(I->dReachOff0, vreachOff0);
+  upload(I->dReachOff1, vreachOff1);
   upload(I->dKind, vkind);
   upload(I->dPlayer, vplayer);
   upload(I->dFoldBy, vfoldBy);
@@ -1400,7 +1445,7 @@ GpuPostflopSolver::GpuPostflopSolver(const PostflopSpot& spot,
   upload(I->dNC1, vnc1);
   upload(I->dComboOff0, vcomboOff0);
   upload(I->dComboOff1, vcomboOff1);
-  upload(I->dReachOff, vreachOff);
+  upload(I->dCfvOff, vreachOff);
   upload(I->dRegOff, vregOff);
   upload(I->dStrOff, vregOff);  // identical row offsets
   upload(I->dNBranch, vnBranch);
@@ -1438,8 +1483,9 @@ GpuPostflopSolver::GpuPostflopSolver(const PostflopSpot& spot,
   GPU_CHECK(cudaMalloc(&I->dStrat, regTotal * sizeof(float)));
   GPU_CHECK(cudaMemset(I->dRegret, 0, regTotal * sizeof(float)));
   GPU_CHECK(cudaMemset(I->dStrat, 0, regTotal * sizeof(float)));
-  GPU_CHECK(cudaMalloc(&I->dReach, reachTotal * sizeof(float)));
   GPU_CHECK(cudaMalloc(&I->dCfv, reachTotal * sizeof(float)));
+  GPU_CHECK(cudaMalloc(&I->dReach0, I->reachTotal0 * sizeof(float)));
+  GPU_CHECK(cudaMalloc(&I->dReach1, I->reachTotal1 * sizeof(float)));
 
   // Range weights / cards / identity map (base space).
   auto uploadD = [&](float*& dst, const std::vector<double>& v) {
@@ -1450,6 +1496,13 @@ GpuPostflopSolver::GpuPostflopSolver(const PostflopSpot& spot,
   };
   uploadD(I->dW0, cc.sides[0].w);
   uploadD(I->dW1, cc.sides[1].w);
+  // Root rows of the reach layouts hold the OPPONENT's initial weights
+  // (the forward pass reads reach, not w, even at node 0). Row 0 of
+  // each layout is the root's (offset 0).
+  GPU_CHECK(cudaMemcpy(I->dReach0, I->dW1, (size_t)n1 * sizeof(float),
+                       cudaMemcpyDeviceToDevice));
+  GPU_CHECK(cudaMemcpy(I->dReach1, I->dW0, (size_t)n0 * sizeof(float),
+                       cudaMemcpyDeviceToDevice));
   GPU_CHECK(cudaMalloc(&I->dCards0, 2 * n0));
   GPU_CHECK(cudaMemcpy(I->dCards0, cc.sides[0].cards.data(), 2 * n0,
                        cudaMemcpyHostToDevice));
@@ -1715,11 +1768,14 @@ void GpuPostflopSolver::solve(int iterations, const std::string& algo,
     // per (tr, depth, kind) bwd attribution, kind in {show, fold,
     // decide+chance}
     std::vector<double> bwdK(2 * D * 3, 0.0);
-    const TreeBuf b = I->buf();
     const int maxBase = std::max(I->n0Base, I->n1Base);
     const size_t smem = (size_t)2 * maxBase * sizeof(float);
     const int gy = (maxBase + kThreads - 1) / kThreads;
     auto timed = [&](bool fwd, int tr, int d, int kmIdx, int mask) {
+      TreeBuf b = I->buf();
+      b.reachOff = tr == 0 ? I->dReachOff0 : I->dReachOff1;
+      b.reach = tr == 0 ? I->dReach0 : I->dReach1;
+      b.reachRW = tr == 0 ? I->dReach0 : I->dReach1;
       GPU_CHECK(cudaEventRecord(ev0, s));
       if (fwd) {
         const int nD = I->decideCount[d], nC = I->chanceCount[d];

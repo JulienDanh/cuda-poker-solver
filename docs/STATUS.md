@@ -135,6 +135,17 @@ after each step):
    as its per-card scatter (barrier kept after the atomics — dropping
    it exposed a run-to-run nondeterminism on one gate spot, so it
    stays), and the graph now prints its node count.
+8. **Reach-row aliasing (traffic, not compute)**: profiling the
+   practical flop tree showed the iteration is DRAM-bandwidth-bound
+   (~7 GB of row traffic per iteration vs the 4070's ~500 GB/s). The
+   forward pass used to copy the reach row unchanged to every child of
+   a pass-through decide node (player == traverser) — now the row
+   LAYOUTS are per traverser and such children alias the parent's row,
+   so the copy disappears. cfv rows stay dense per node (children of a
+   pass-through node still produce distinct cfv), which is why TreeBuf
+   carries a separate cfvOff table. The root rows are initialized from
+   the opponent's range weights and the fwd kernel reads reach, not w.
+   Turn spots +2-6%, practical flop +3.5-5%.
 7. **Tried and reverted: warp-per-node backward** (motivated by the
    per-kind profile: showdown ~45-50% of the backward, decide ~20%,
    fold ~15%): one node per warp, per-warp shared slices, no block
@@ -144,8 +155,9 @@ after each step):
    hides gather/scatter latency with 4x more threads per node;
    same lesson as the block-batching experiment (item 4).
 
-Cumulative turn throughput: ~3.9x (wide 193 -> ~747, standard 1401 ->
-~4,650, shortstack 96 -> ~89 us/iter).
+Cumulative turn throughput: ~4.0x (wide 193 -> ~785, standard 1401 ->
+~4,730, shortstack 96 -> ~87 us/iter); practical flop 56 -> ~58
+iters/s (1500 stack) and 201 -> ~211 (500 stack).
 
 ### Bugs found by validation so far (all fixed)
 
