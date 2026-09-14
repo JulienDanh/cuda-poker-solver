@@ -715,6 +715,7 @@ struct GpuPostflopSolver::Impl {
   // table, and the compiled spot + bet config (identity of the file).
   std::vector<int> hChildBase, hChildFlat, hComboId, hComboOff0,
       hComboOff1, hNC0, hNC1, sameOther1;
+  std::vector<uint8_t> hKind;
   std::vector<pf::TreeAction> actFlat;
   PostflopSpot spot;
   pf::BetConfig cfg;
@@ -1792,6 +1793,7 @@ void GpuPostflopSolver::init(const PostflopSpot& spot,
   // Host copies for tree introspection / per-combo queries / save().
   I->hChildBase = vchildBase;
   I->hChildFlat = cc.childFlat;
+  I->hKind.assign(vkind.begin(), vkind.end());
   I->hComboId = cc.comboId;
   I->hComboOff0 = vcomboOff0;
   I->hComboOff1 = vcomboOff1;
@@ -2292,6 +2294,15 @@ std::vector<double> GpuPostflopSolver::playerWeights(int player) const {
   if (player < 0 || player > 1)
     throw std::runtime_error("player must be 0 (OOP) or 1 (IP)");
   return player == 0 ? I->w0 : I->w1;
+}
+
+TreeStructure GpuPostflopSolver::treeStructure() const {
+  Impl* I = impl_;
+  TreeStructure t;
+  t.kinds = I->hKind;
+  t.childBase = I->hChildBase;
+  t.children = I->hChildFlat;
+  return t;
 }
 
 // Solution files: self-describing, little-endian. The tree layout is a

@@ -13,7 +13,7 @@ SRCS := src/cards.cpp src/common.cpp src/eval.cpp src/fgs.cpp src/hand169.cpp \
 HEADERS := $(wildcard src/*.h)
 BUILD := build
 
-.PHONY: all test verify-pfs stub-bias gpu-quick gpu-parity turn-bench flop-bench perf-loop python python-test clean
+.PHONY: all test verify-pfs stub-bias gpu-quick gpu-parity turn-bench flop-bench perf-loop python python-test api api-test ui-test clean
 
 all: $(BUILD)/ppsolve
 
@@ -89,6 +89,21 @@ python:
 # warm-start equivalence. Complements the oracle gates.
 python-test: python
 	$(PYTHON) python/test_pps.py
+
+# Solver HTTP API (python/pps_api.py) + web UI: run the server on
+# localhost:8070 (docs at /docs, UI at /ui). Requires the pps module
+# (make python) plus fastapi + uvicorn + httpx in the Python env.
+api: python
+	cd python && $(PYTHON) -m uvicorn pps_api:app --host 127.0.0.1 --port 8070
+
+# HTTP API tests (python/test_pps_api.py, in-process TestClient) —
+# includes the served-UI and action-path checks.
+api-test: python
+	$(PYTHON) python/test_pps_api.py
+
+# Alias: the UI's checks live in the api test suite (static serving +
+# path labels). `make api` serves the UI at http://127.0.0.1:8070/ui/.
+ui-test: api-test
 
 clean:
 	rm -rf $(BUILD)

@@ -211,6 +211,28 @@ after each step):
     normalization, EV aggregation vs stats(), save/load roundtrip
     equality, warm-start trajectory equality). Perf-loop green before
     commit (no regression: 0.999-1.030x).
+14. **HTTP API + web UI (`pps_api`)**: FastAPI over the package
+    (`make api` / `make api-test`) with a solver registry (instances
+    hold GPU state; LRU eviction at PPS_API_MAX_SOLVERS, default 8),
+    endpoints for the full lifecycle (create/solve/continue/reset/
+    stats/strategy/decide-nodes/root-ev/save/load), solution files
+    sandboxed to PPS_API_DATA_DIR, and a static UI at `/ui/` (no
+    frontend build step). The native module now releases the GIL
+    around engine calls, so a long solve no longer blocks the other
+    endpoints; solves serialize on one global lock, queries on a
+    per-solver lock. The decide-node listing carries server-computed
+    action-path labels ("check — bet 150 — call — deal", via the new
+    `treeStructure()` engine accessor: per-node kind + CSR children).
+    UI reuse was researched rather than assumed: the reference open
+    GTO UI (b-inary/desktop-postflop, built on postflop-solver — the
+    engine this repo validates against) is AGPL-3.0 and GTOpen (Rust +
+    CUDA + browser UI, closest architecture match) ships NO license —
+    neither can be legally reused in this MIT repo, so the UI is our
+    own plain HTML/CSS/JS mirroring the desktop-postflop workflow:
+    52-card board picker, range inputs, solve-to-target with progress,
+    tree browser with paths and per-combo strategy grids, root-EV
+    tables, save/load/warm-start. 5-test HTTP suite + live-server
+    smoke (health, /ui/, one-shot solve) + quick gate green.
 
 Cumulative turn throughput: ~4.0x (wide 193 -> ~785, standard 1401 ->
 ~4,730, shortstack 96 -> ~87 us/iter); practical flop 56 -> ~58

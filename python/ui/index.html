@@ -1,0 +1,113 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>pps solver</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header>
+  <h1>pps — GPU postflop solver</h1>
+  <div id="conn">checking…</div>
+</header>
+
+<main>
+  <!-- ============ left: spot + session ============ -->
+  <section id="left">
+
+    <div class="panel">
+      <h2>Board</h2>
+      <div id="board-slots"></div>
+      <div id="card-picker"></div>
+      <button class="mini" id="clear-board">clear board</button>
+    </div>
+
+    <div class="panel">
+      <h2>Ranges &amp; structure</h2>
+      <label>OOP (player 0)</label>
+      <textarea id="oop" rows="2">TT+,AKo</textarea>
+      <label>IP (player 1)</label>
+      <textarea id="ip" rows="2">AQ+,KQs</textarea>
+      <div class="row">
+        <div><label>pot</label><input id="pot" type="number" value="200" min="0"></div>
+        <div><label>stack</label><input id="stack" type="number" value="500" min="1"></div>
+      </div>
+      <div class="row">
+        <div><label>bet sizes</label><input id="bets" value="0.75,a"></div>
+        <div><label>raise sizes</label><input id="raises" value="2.5,3"></div>
+      </div>
+    </div>
+
+    <div class="panel">
+      <h2>Solve</h2>
+      <div class="row">
+        <div><label>max iterations</label><input id="iters" type="number" value="2000" min="1"></div>
+        <div><label>target expl (chips, optional)</label><input id="target" type="number" step="0.01" min="0" placeholder="e.g. 0.1"></div>
+      </div>
+      <button id="solve" class="primary">Solve spot</button>
+    </div>
+
+    <div class="panel">
+      <h2>Solvers</h2>
+      <div id="solver-list" class="slist"></div>
+      <div class="row buttons">
+        <button class="mini" id="continue-btn">+ iterations</button>
+        <button class="mini" id="to-target-btn">to target</button>
+        <button class="mini" id="reset-btn">reset</button>
+        <button class="mini" id="save-btn">save</button>
+        <button class="mini" id="load-btn">load</button>
+        <button class="mini danger" id="delete-btn">delete</button>
+      </div>
+    </div>
+
+  </section>
+
+  <!-- ============ right: results ============ -->
+  <section id="right">
+
+    <div class="panel" id="stats-panel">
+      <h2>Stats</h2>
+      <div id="stats" class="stats">no solution loaded</div>
+    </div>
+
+    <nav id="tabs">
+      <button data-tab="strategy" class="tab active">Strategy</button>
+      <button data-tab="tree" class="tab">Tree</button>
+      <button data-tab="ev" class="tab">Root EV</button>
+    </nav>
+
+    <div class="panel tab-body" id="tab-strategy">
+      <h2 id="strat-title">Strategy — node 0</h2>
+      <div id="aggregate"></div>
+      <div class="tbl-wrap"><table id="strat-table"></table></div>
+    </div>
+
+    <div class="panel tab-body hidden" id="tab-tree">
+      <h2>Decision nodes</h2>
+      <input id="node-filter" placeholder="filter by path (e.g. bet 150)">
+      <div id="tree-list" class="treelist"></div>
+      <div class="row">
+        <button class="mini" id="tree-prev">prev</button>
+        <span id="tree-page"></span>
+        <button class="mini" id="tree-next">next</button>
+      </div>
+    </div>
+
+    <div class="panel tab-body hidden" id="tab-ev">
+      <h2>Per-combo root EV (vs average strategy)</h2>
+      <div class="row">
+        <button class="mini" data-evp="oop" class="active">OOP</button>
+        <button class="mini" data-evp="ip">IP</button>
+      </div>
+      <div class="tbl-wrap"><table id="ev-table"></table></div>
+    </div>
+
+  </section>
+</main>
+
+<div id="overlay" class="hidden"><div id="overlay-text">solving… <span id="elapsed"></span></div></div>
+
+<script src="app.js"></script>
+</body>
+</html>

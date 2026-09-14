@@ -84,6 +84,16 @@ struct ComboEv {
   std::vector<double> mass[2];
 };
 
+// Raw tree structure for traversal/UIs: per-node kind (0 decide,
+// 1 showdown, 2 fold, 3 chance) and the CSR child table (node u's
+// children are children[childBase[u] .. ] for decide/chance nodes;
+// fold/showdown nodes have none).
+struct TreeStructure {
+  std::vector<uint8_t> kinds;
+  std::vector<int> childBase;
+  std::vector<int> children;
+};
+
 class GpuPostflopSolver {
  public:
   // Compiles the spot to device dataflow (tree build + upload).
@@ -167,6 +177,10 @@ class GpuPostflopSolver {
   // The compiled range weights per player, aligned with playerCards(p)
   // (board-filtered, positive-weight only).
   std::vector<double> playerWeights(int player) const;
+
+  // Per-node kind (decide/showdown/fold/chance) plus the CSR children
+  // table — enough to walk the whole tree from the root.
+  TreeStructure treeStructure() const;
 
   int numNodes() const { return numNodes_; }
   int maxDepth() const { return maxDepth_; }

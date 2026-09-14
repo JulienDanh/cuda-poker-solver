@@ -236,25 +236,43 @@ class Solver {
     cfg.betAllIn = sawAllIn;
     cfg.raiseMults = parseDoubleList(raises);
     cfg.maxRaises = maxRaises;
+    // The compile (tree build + upload) is the heavy part and touches
+    // no Python objects — release the GIL so other threads (an API
+    // server) keep serving during it.
+    py::gil_scoped_release rel;
     solver_ = std::make_unique<GpuPostflopSolver>(spot, cfg);
   }
 
   static std::unique_ptr<Solver> load(const std::string& path) {
     auto s = std::unique_ptr<Solver>(new Solver());
+    py::gil_scoped_release rel;
     s->solver_ = std::make_unique<GpuPostflopSolver>(path);
     return s;
   }
 
+  // The engine calls below run without the GIL (they never touch
+  // Python objects), so a long solve does not freeze the interpreter
+  // thread pool. Concurrency between threads must still be handled by
+  // the caller: two threads driving one solver interleave CUDA work.
   void solve(int maxIters, const std::string& algo, double target) {
+    py::gil_scoped_release rel;
     solver_->solve(maxIters, algo, target);
   }
   void continueSolve(int maxIters, double target) {
+    py::gil_scoped_release rel;
     solver_->continueSolve(maxIters, target);
   }
-  void reset() { solver_->reset(); }
+  void reset() {
+    py::gil_scoped_release rel;
+    solver_->reset();
+  }
 
   py::dict stats() {
-    auto st = solver_->stats();
+    pps::pf::NodeStats st;
+    {
+      py::gil_scoped_release rel;
+      st = solver_->stats();
+    }
     py::dict d;
     d["ev_oop"] = st.ev0;
     d["ev_ip"] = st.ev1;
@@ -270,9 +288,16 @@ class Solver {
   int64_t totalIterations() const { return solver_->totalIterations(); }
 
   py::list decideNodes() const {
+    std::vector<pps::gpu::DecideNodeInfo> ns;
+    {
+      py::gil_scoped_release rel;
+      ns.reserve(solver_->numDecideNodes());
+      for (int i = 0; i < solver_->numDecideNodes(); ++i)
+        ns.push_back(solver_->decideNode(i));
+    }
     py::list out;
-    for (int i = 0; i < solver_->numDecideNodes(); ++i) {
-      auto n = solver_->decideNode(i);
+    for (size_t i = 0; i < ns.size(); ++i) {
+      const auto& n = ns[i];
       py::dict d;
       d["index"] = i;
       d["node_id"] = n.nodeId;
@@ -296,8 +321,17 @@ class Solver {
   // (present only for first-street nodes, where base range weights are
   // the exact reach weights) is the range-weighted frequency vector.
   py::dict strategy(int decideIdx) {
-    auto cs = solver_->comboStrategy(decideIdx);
-    const auto& n = solver_->decideNode(decideIdx);
+    pps::gpu::ComboStrategy cs;
+    pps::gpu::DecideNodeInfo n;
+    std::vector<uint8_t> cards;
+    std::vector<double> agg;
+    {
+      py::gil_scoped_release rel;
+      cs = solver_->comboStrategy(decideIdx);
+      n = solver_->decideNode(decideIdx);
+      cards = solver_->playerCards(n.player);
+      agg = solver_->nodeStrategy(decideIdx);
+    }
     const int na = (int)cs.actions.size();
     const int nC = (int)cs.combos.size();
     py::dict d;
@@ -309,7 +343,6 @@ class Solver {
     for (const auto& a : cs.actions) acts.append(actionDict(a));
     d["actions"] = acts;
     // Column labels: the deciding player's combo at this node.
-    auto cards = solver_->playerCards(n.player);
     py::list cardList;
     for (int c : cs.combos)
       cardList.append(comboText(cards[2 * c], cards[2 * c + 1]));
@@ -318,7 +351,6 @@ class Solver {
     std::copy(cs.freqs.begin(), cs.freqs.end(), freqs.mutable_data());
     d["freqs"] = freqs;
     d["combos"] = cs.combos;  // base-list slots, for joining with weights
-    const auto agg = solver_->nodeStrategy(decideIdx);
     if (!agg.empty()) d["aggregate"] = toArray(agg);
     return d;
   }
@@ -326,15 +358,20 @@ class Solver {
   // Per-combo root EVs vs the average strategy (chips), aligned with
   // each player's base list.
   py::dict rootEv() {
-    auto ev = solver_->rootEvPerCombo();
+    pps::gpu::ComboEv ev;
+    std::vector<uint8_t> cards[2];
+    {
+      py::gil_scoped_release rel;
+      ev = solver_->rootEvPerCombo();
+      for (int p = 0; p < 2; ++p) cards[p] = solver_->playerCards(p);
+    }
     py::dict out;
     const char* names[2] = {"oop", "ip"};
     for (int p = 0; p < 2; ++p) {
-      auto cards = solver_->playerCards(p);
       py::list cardList;
       for (size_t i = 0; i < ev.combos[p].size(); ++i) {
         const int c = ev.combos[p][i];
-        cardList.append(comboText(cards[2 * c], cards[2 * c + 1]));
+        cardList.append(comboText(cards[p][2 * c], cards[p][2 * c + 1]));
       }
       py::dict d;
       d["combos"] = toVectorList(ev.combos[p]);
@@ -346,7 +383,10 @@ class Solver {
     return out;
   }
 
-  void save(const std::string& path) const { solver_->save(path); }
+  void save(const std::string& path) const {
+    py::gil_scoped_release rel;
+    solver_->save(path);
+  }
 
   // Raw card ids per player: flat list cards[2i], cards[2i+1] of combo
   // slot i (the engine's 0..51 card index: suit*13 + rank).
@@ -361,6 +401,25 @@ class Solver {
   }
   int numBaseCombos(int player) const {
     return solver_->numBaseCombos(player);
+  }
+
+  // Per-node kind (0 decide, 1 showdown, 2 fold, 3 chance) + CSR
+  // children table — enough to walk the whole tree from the root.
+  py::dict treeStructure() const {
+    pps::gpu::TreeStructure t;
+    {
+      py::gil_scoped_release rel;
+      t = solver_->treeStructure();
+    }
+    py::list kinds, childBase, children;
+    for (uint8_t k : t.kinds) kinds.append((int)k);
+    for (int c : t.childBase) childBase.append(c);
+    for (int c : t.children) children.append(c);
+    py::dict d;
+    d["kinds"] = kinds;
+    d["child_base"] = childBase;
+    d["children"] = children;
+    return d;
   }
 
  private:
@@ -407,5 +466,6 @@ PYBIND11_MODULE(pps_native, m) {
       .def("save", &Solver::save, py::arg("path"))
       .def("player_cards", &Solver::playerCardsList, py::arg("player"))
       .def("player_weights", &Solver::playerWeightsArr, py::arg("player"))
-      .def("num_base_combos", &Solver::numBaseCombos, py::arg("player"));
+      .def("num_base_combos", &Solver::numBaseCombos, py::arg("player"))
+      .def("tree_structure", &Solver::treeStructure);
 }

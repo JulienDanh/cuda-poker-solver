@@ -19,9 +19,7 @@ build reconfigures `build-cuda` with `-DPython3_EXECUTABLE=$(PYTHON)`
 ```python
 import sys; sys.path.insert(0, "python")
 import pps
-```
-
-## API
+```## API
 
 ```python
 import pps
@@ -103,3 +101,52 @@ aggregation against `stats()`, warm-start trajectory equivalence,
 save/load roundtrip (rows identical, continuation), and error paths.
 The oracle parity gates (`make gpu-parity`) remain the correctness
 gate for the engine conventions.
+
+## HTTP API + web UI
+
+`python/pps_api.py` (FastAPI) serves the solver over HTTP and ships a
+static web UI (`python/ui/`, no frontend build step):
+
+```
+make api           # uvicorn on 127.0.0.1:8070 — UI at /ui/, docs at /docs
+make api-test      # in-process HTTP test suite (python/test_pps_api.py)
+```
+
+Solver instances hold GPU state, so the app keeps a registry (LRU,
+`PPS_API_MAX_SOLVERS`, default 8): create a solver, solve, query,
+continue, save/load. Endpoints:
+
+```
+GET    /health
+POST   /solve                      one-shot: compile + solve + results
+POST   /solvers                    compile a spot, register it
+GET    /solvers                    list instances
+GET    /solvers/{id}               metadata (nodes, iterations, ...)
+DELETE /solvers/{id}
+POST   /solvers/{id}/solve         {"max_iters": 2000, "target": 0.1}
+POST   /solvers/{id}/continue      warm-start more iterations
+POST   /solvers/{id}/reset         back to untrained
+GET    /solvers/{id}/stats         EVs + exploitability (fresh walk)
+GET    /solvers/{id}/strategy?node=0       labeled per-combo strategy
+GET    /solvers/{id}/decide-nodes?offset&limit     tree with action
+                                                paths ("check — bet 150 —
+                                                call — deal — ...")
+GET    /solvers/{id}/root-ev       per-combo EVs + masses
+POST   /solvers/{id}/save          {"name": "spot.sol"} (sandboxed)
+POST   /solvers/load               {"name": "spot.sol"}
+```
+
+Concurrency: the native module releases the GIL during engine calls,
+so one long solve does not freeze the other endpoints; solves
+serialize on a global lock (one GPU), queries lock their solver only.
+Solution files live under `PPS_API_DATA_DIR` (default
+`build-cuda/api-solutions`); names are sandboxed to that directory.
+
+The UI (`/ui/`) mirrors the desktop-postflop workflow (the reference
+open-source GTO UI, which this repo cannot reuse code from — it is
+AGPL-3.0 and this repo is MIT): a 52-card board picker, range inputs,
+solve-to-target with progress, a decision-tree browser with labeled
+action paths, per-combo strategy grids with color-weighted
+frequencies, per-combo EV tables, and save/load/warm-start controls.
+No external code is included — it is plain HTML/CSS/JS served as
+static files.
