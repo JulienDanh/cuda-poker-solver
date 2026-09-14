@@ -67,6 +67,25 @@ a redundant middle rung. Its bet-tree construction lives on as
 | standard (200 pot, 500 stack) | 5,943 | ~205 ms | 215 us/iter | ~4,650 |
 | wide/deep (1500 stack, 4+ sizes) | 51,903 | ~230 ms | ~1,240-1,340 us/iter | ~747-807 |
 
+### Flop spots (measured, not yet gated)
+
+| spot | nodes | depth | GPU compile | GPU solve | oracle solve | speedup |
+|---|---|---|---|---|---|---|
+| standard (200 pot, 500 stack, 2 sizes) | 615,234 | 11 | 2.7 s | 18 ms/iter (55/s) | ~86 ms/iter (~11.6/s) | ~4.7x |
+| wide (1500 stack, 4 sizes) | 11,716,550 | 14 | 49.6 s | 1747 ms/iter (0.57/s) | ~150 ms/iter (~0.65/s) | ~0.9x |
+
+Parity holds on both (EV diff 0.0008 at 200 iters standard; 0.0018 at
+100 iters wide). The wide flop fits in ~1.5 GB VRAM. Two flop-specific
+findings: the GPU's node throughput drops ~6x vs the turn trees (39M
+-> 6.7M nodes/s) because chance-dealt flop trees are showdown-heavy
+(~600k showdown nodes per iteration over ~1,900 runout boards), and
+the per-showdown block cost is the bottleneck — so on the widest flop
+spot the 12-thread CPU oracle matches the GPU per iteration. The
+single-threaded host tree build also becomes a real cost (50 s for
+the 11.7M-node tree). Making the GPU win on wide flops is the
+strength-sorted row relayout / per-board showdown amortization work,
+not more micro-tuning.
+
 Per-iteration cost is dominated by the solve replay; compile is a fixed
 ~200 ms (mostly CUDA context init on WSL); the stats walk is single-digit
 ms. Work log for the turn perf phase (all gated by `make gpu-quick`
