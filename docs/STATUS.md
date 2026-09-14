@@ -135,7 +135,7 @@ after each step):
    as its per-card scatter (barrier kept after the atomics — dropping
    it exposed a run-to-run nondeterminism on one gate spot, so it
    stays), and the graph now prints its node count.
-10. **Tested and rejected: HS-DCFR(30) for solve-to-target**: hs30's
+11. **Tested and rejected: HS-DCFR(30) for solve-to-target**: hs30's
     discount schedule assumes a large fixed budget — against a 0.01
     target on the 1500-stack flop it needed 6,912 iterations (120 s)
     vs DCFR's ~2,560 (~50 s), and 2,048 vs 512 against 0.1. Vanilla
@@ -143,7 +143,17 @@ after each step):
     expl-ratio floor also moved 0.35 -> 0.30 after a second observed
     noise-tail flake (a broken BR walk collapses to ~0.001, so the
     guard is unaffected).
-9. **Compile: quadratic chance-table scan removed**: the ctap and
+12. **Tested and rejected: DCFR gamma=2 averaging discount**: the DCFR
+    paper's original gamma=2 (vs the gamma=3 staircase the engine and
+    the oracle both use) measured within noise on iterations to the
+    0.01-chip target on the deep flop — mean ~2,347 vs 2,432 — but
+    with 8x the run-to-run variance (2,048-2,816 vs three identical
+    2,432s): lighter discounting keeps early-iteration noise alive in
+    the average near the crossing point. gamma=3 stays (deterministic
+    target behavior, exact oracle match). With HS-DCFR also rejected,
+    the CFR-variant sweep is exhausted; DCFR(1.5, 0, 3) is the
+    confirmed default.
+10. **Compile: quadratic chance-table scan removed**: the ctap and
    expIdx fills rescanned the parent combo list for every (branch,
    child combo) pair — O(branches x combos x parentN) per chance node,
    billions of comparisons on flop trees. The parent slot is captured
@@ -154,7 +164,7 @@ after each step):
    (500-stack), 49.6 -> 35.2 s (the 11.7M wide flop). End-to-end to the
    0.1-chip target: 500-stack flop 3.2 -> 2.1 s, 1500-stack 13.8 ->
    11.1 s.
-8. **Reach-row aliasing (traffic, not compute)**: profiling the
+9. **Reach-row aliasing (traffic, not compute)**: profiling the
    practical flop tree showed the iteration is DRAM-bandwidth-bound
    (~7 GB of row traffic per iteration vs the 4070's ~500 GB/s). The
    forward pass used to copy the reach row unchanged to every child of
@@ -165,7 +175,7 @@ after each step):
    carries a separate cfvOff table. The root rows are initialized from
    the opponent's range weights and the fwd kernel reads reach, not w.
    Turn spots +2-6%, practical flop +3.5-5%.
-7. **Tried and reverted: warp-per-node backward** (motivated by the
+8. **Tried and reverted: warp-per-node backward** (motivated by the
    per-kind profile: showdown ~45-50% of the backward, decide ~20%,
    fold ~15%): one node per warp, per-warp shared slices, no block
    barriers. 1.5-2x SLOWER across the board — small trees lose block
