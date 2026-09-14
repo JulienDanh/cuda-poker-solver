@@ -324,18 +324,21 @@ async function selectNode(idx, step) {
 let currentNode = 0;
 
 function renderSpot(nav) {
-  // big board cards; undealt cards are dimmed (n_board = cards live
-  // at this node — deeper nodes have seen the deal)
+  // big board cards: the input board plus the dealt cards picked along
+  // the current history; cards beyond the node's live board are dimmed
   const bb = $("big-board");
   bb.innerHTML = "";
-  board.forEach((c, i) => {
-    const dealt = i < (nav ? nav.n_board : board.length);
+  const dealt = history.filter((s) => s.card).map((s) => s.card);
+  const live = nav ? nav.n_board : board.length + dealt.length;
+  board.concat(dealt).slice(0, 5).forEach((c, i) => {
     const d = el("div", "bcard" + (SUIT_RED[c[1]] ? " red" : ""),
       c[0] + SUIT_GLYPH[c[1]]);
-    if (!dealt) d.style.opacity = ".25";
+    if (i >= live) d.style.opacity = ".25";
+    if (dealt.includes(c) && i < live) d.style.boxShadow = "0 0 0 2px var(--accent)";
     bb.appendChild(d);
   });
-  for (let i = board.length; i < 5; i++) bb.appendChild(el("div", "bcard"));
+  for (let i = board.length + dealt.length; i < 5; i++)
+    bb.appendChild(el("div", "bcard"));
 
   // breadcrumb
   const h = $("history");
@@ -347,15 +350,18 @@ function renderSpot(nav) {
       `<span class="who p${s.who}">${s.who === 0 ? "OOP" : "IP"}</span> `;
     c.innerHTML = whoSpan + s.label;
     c.onclick = () => {
+      if (s.node == null) return;  // deal chips: pick via the runout grid
       history = history.slice(0, i + 1);
       selectNode(s.node);
     };
     h.appendChild(c);
   });
 
-  // action buttons (with per-action EVs when available)
+  // action buttons (with per-action EVs when available) + runout pickers
   const na = $("nav-actions");
   na.innerHTML = "";
+  const runouts = $("runout-strip");
+  runouts.innerHTML = "";
   nav.actions.forEach((a, i) => {
     const b = document.createElement("button");
     const kindIdx = nav.actions.filter((x, j) => x.kind === a.kind && j <= i).length - 1;
@@ -368,17 +374,45 @@ function renderSpot(nav) {
       parts.push({ fold: "terminal", showdown: "terminal",
         chance: "runout — terminal" }[a.child_kind] || "terminal");
     } else if (a.child_kind === "chance") {
-      parts.push("deals next street");
+      parts.push("pick a runout");
     }
     b.innerHTML = `${a.label}<small>${parts.join(" · ")}</small>`;
-    b.disabled = a.next_decide == null;
-    b.onclick = () => {
-      if (a.next_decide == null) return;
-      // the chip records who acted: the current node's deciding player
-      const who = currentStrategy ? currentStrategy.player : 0;
-      selectNode(a.next_decide,
-        { node: a.next_decide, label: a.label, who });
-    };
+    if (a.branches && a.branches.some((x) => x.next_decide != null)) {
+      // deal edge: show the runout picker instead of jumping to an
+      // arbitrary first branch
+      b.disabled = false;
+      b.onclick = () => {
+        const strip = document.createElement("div");
+        strip.className = "runoutgrid";
+        a.branches.forEach((br) => {
+          const rc = document.createElement("div");
+          rc.className = "pk " + clsOf(br.card) + (br.next_decide == null ? " used" : "");
+          rc.textContent = br.card;
+          rc.title = br.next_decide == null ? "runout to showdown" :
+            "deal " + br.card;
+          if (br.next_decide != null) {
+            rc.onclick = () => {
+              const who = currentStrategy ? currentStrategy.player : 0;
+              selectNode(br.next_decide,
+                { node: br.next_decide, label: br.card, card: br.card,
+                  who: null });
+            };
+          }
+          strip.appendChild(rc);
+        });
+        runouts.innerHTML = `<div class="dim">runouts after ${a.label} — click a card:</div>`;
+        runouts.appendChild(strip);
+      };
+    } else {
+      b.disabled = a.next_decide == null;
+      b.onclick = () => {
+        if (a.next_decide == null) return;
+        // the chip records who acted: the current node's deciding player
+        const who = currentStrategy ? currentStrategy.player : 0;
+        selectNode(a.next_decide,
+          { node: a.next_decide, label: a.label, who });
+      };
+    }
     na.appendChild(b);
   });
 
@@ -508,13 +542,14 @@ async function renderTree() {
         `<span>${n.path}</span>`;
       d.onclick = () => {
         // rebuild the history from the path: decide actions alternate
-        // the actor (heads-up), deal steps carry no actor
+        // the actor (heads-up), deal steps carry the dealt card
         const steps = n.path.split(" — ");
         history = [{ node: 0, label: "(root)", who: 0 }];
         let who = 0;
         for (const st of steps.slice(1)) {
-          if (st === "deal") {
-            history.push({ node: null, label: "deal", who: null });
+          const m = st.match(/^deal (.+)$/);
+          if (m) {
+            history.push({ node: null, label: m[1], card: m[1], who: null });
             continue;
           }
           history.push({ node: null, label: st, who });

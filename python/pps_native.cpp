@@ -452,14 +452,17 @@ class Solver {
       py::gil_scoped_release rel;
       t = solver_->treeStructure();
     }
-    py::list kinds, childBase, children;
+    py::list kinds, childBase, children, boards;
     for (uint8_t k : t.kinds) kinds.append((int)k);
     for (int c : t.childBase) childBase.append(c);
     for (int c : t.children) children.append(c);
+    // 5 card ids per node; nulls would be noise — emit raw ids
+    for (uint8_t c : t.boards) boards.append((int)c);
     py::dict d;
     d["kinds"] = kinds;
     d["child_base"] = childBase;
     d["children"] = children;
+    d["boards"] = boards;
     return d;
   }
 

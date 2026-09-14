@@ -296,6 +296,22 @@ after each step):
     tolerance to the measured f32 walk noise (1.45e-6, fold-atomics
     rounding across separate walks): 1e-4 with a comment.
 
+19. **Runout navigation (GTO-style per-card browsing)**: deal edges are
+    no longer anonymous. The engine now exposes per-node boards
+    (TreeStructure.boards, 5 packed slots — note card id 0 IS the 2c,
+    so deals must be diffed by board LENGTH, never by nonzero slots;
+    a chance node's board length is 52 - its branch count). Path
+    labels read "check — check — deal 2c — ... — deal Tc", node-nav
+    returns per-branch {card, next_decide} for every runout, and the
+    UI shows a runout card grid when an action leads to a deal —
+    click a card to study that exact line; the spot board displays
+    the dealt cards highlighted. Previously all 49 turn runouts of a
+    flop tree shared one indistinguishable "deal" label and the
+    action button jumped to an arbitrary first branch. Gated by
+    test_runout_branches (49 distinct ascending cards, no board
+    collisions, card-id-0 deal, branch navigation lands on a turn
+    decide node). Perf-loop + quick gate green; live-verified.
+
 Cumulative turn throughput: ~4.0x (wide 193 -> ~785, standard 1401 ->
 ~4,730, shortstack 96 -> ~87 us/iter); practical flop 56 -> ~58
 iters/s (1500 stack) and 201 -> ~211 (500 stack).

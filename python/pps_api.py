@@ -212,11 +212,13 @@ def _node_paths(e: "_Entry") -> List[str]:
 
     Child node ids are always greater than their parent's (the tree
     builder allocates parents first), so one forward pass works.
-    Decide edges carry their action label; chance edges are the deal.
-    Also caches the tree structure, the node_id -> decide index map
-    and the full decide-node list (static tree) for the listing
-    endpoint — a flop tree has tens of thousands of decide nodes and
-    must not be rebuilt per pagination request.
+    Decide edges carry their action label; chance edges carry the
+    dealt card ("deal Ah") — the card present in the branch child's
+    board but not the chance node's. Also caches the tree structure,
+    the node_id -> decide index map and the full decide-node list
+    (static tree) for the listing endpoint — a flop tree has tens of
+    thousands of decide nodes and must not be rebuilt per pagination
+    request.
     """
     if e.paths is not None:
         return e.paths
@@ -224,6 +226,7 @@ def _node_paths(e: "_Entry") -> List[str]:
         tree = _engine(e.solver.tree_structure)
         dns = _engine(e.solver.decide_nodes)
     kinds, cb, ch = tree["kinds"], tree["child_base"], tree["children"]
+    bd = tree["boards"]
     n = len(kinds)
     acts = {d["node_id"]: d["actions"] for d in dns}
     paths = [""] * n
@@ -238,16 +241,33 @@ def _node_paths(e: "_Entry") -> List[str]:
                 lab = _action_text(a)
                 c = ch[cb[u] + i]
                 paths[c] = f"{p} — {lab}" if p else lab
-        elif kinds[u] == 3:  # chance: the deal
+        elif kinds[u] == 3:  # chance: one labeled deal edge per branch
+            nbu = 52 - cnt  # nBranch = 52 - nBoard
             for i in range(cnt):
                 c = ch[cb[u] + i]
-                paths[c] = f"{p} — deal"
+                paths[c] = f"{p} — deal {_dealt_card(bd, u, c, nbu)}"
         # fold/showdown are leaves
     e.paths = paths
     e.tree = tree
     e.decide_idx = {d["node_id"]: d["index"] for d in dns}
     e.nodes = dns
     return paths
+
+
+def _dealt_card(boards: List[int], parent: int, child: int,
+                n_parent: int) -> str:
+    """The card the branch `child` added over its chance parent.
+
+    Boards are 5 packed slots with undealt slots zeroed — and card id
+    0 IS a valid card (2c) — so slice by the parent's board length,
+    never by nonzero entries.
+    """
+    pu = boards[5 * parent:5 * parent + n_parent]
+    cu = boards[5 * child:5 * child + n_parent + 1]
+    rest = list(cu)
+    for c in pu:
+        rest.remove(c)
+    return _card_text(rest[0]) if len(rest) == 1 else "?"
 
 
 def _first_decide(e: "_Entry", start: int) -> Optional[int]:
@@ -476,7 +496,14 @@ def solver_node_nav(sid: str, node: int = Query(0, ge=0)) -> Dict[str, Any]:
         raise HTTPException(400, f"decide node {node} out of range")
     d = dns[node]
     kinds, cb, ch = e.tree["kinds"], e.tree["child_base"], e.tree["children"]
+    bd = e.tree["boards"]
     kind_name = {0: "decide", 1: "showdown", 2: "fold", 3: "chance"}
+    n = len(kinds)
+
+    def child_count(u):
+        nxt = cb[u + 1] if u + 1 < n else len(ch)
+        return nxt - cb[u]
+
     actions = []
     for a, child in zip(d["actions"], d["children"]):
         item = {"label": _action_text(a), "kind": a["kind"],
@@ -485,6 +512,18 @@ def solver_node_nav(sid: str, node: int = Query(0, ge=0)) -> Dict[str, Any]:
         nxt = child if kinds[child] == 0 else _first_decide(e, child)
         item["next_decide"] = \
             e.decide_idx[nxt] if nxt is not None else None
+        if kinds[child] == 3:
+            # a deal: per-branch runouts with their cards
+            n_chance = 52 - child_count(child)  # nBranch = 52 - nBoard
+            branches = []
+            for i in range(child_count(child)):
+                bc = ch[cb[child] + i]
+                bn = bc if kinds[bc] == 0 else _first_decide(e, bc)
+                branches.append({
+                    "card": _dealt_card(bd, child, bc, n_chance),
+                    "next_decide":
+                        e.decide_idx[bn] if bn is not None else None})
+            item["branches"] = branches
         actions.append(item)
     return {"node": node, "path": e.paths[d["node_id"]] or "(root)",
             "player": d["player"], "n_board": d["n_board"],

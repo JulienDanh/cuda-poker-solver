@@ -717,6 +717,7 @@ struct GpuPostflopSolver::Impl {
       hComboOff1, hNC0, hNC1, sameOther1;
   std::vector<int> hReachOff0, hReachOff1, hCfvOff;
   std::vector<uint8_t> hKind;
+  std::vector<uint8_t> hNodeBoard;  // 5 card ids per node (0 = undealt)
   std::vector<pf::TreeAction> actFlat;
   PostflopSpot spot;
   pf::BetConfig cfg;
@@ -1795,6 +1796,10 @@ void GpuPostflopSolver::init(const PostflopSpot& spot,
   I->hChildBase = vchildBase;
   I->hChildFlat = cc.childFlat;
   I->hKind.assign(vkind.begin(), vkind.end());
+  I->hNodeBoard.reserve((size_t)I->numNodes * 5);
+  for (int u = 0; u < I->numNodes; ++u)
+    for (int i = 0; i < 5; ++i)
+      I->hNodeBoard.push_back(cc.nodes[u].board[i]);
   I->hReachOff0 = vreachOff0;
   I->hReachOff1 = vreachOff1;
   I->hCfvOff = vreachOff;
@@ -2306,6 +2311,7 @@ TreeStructure GpuPostflopSolver::treeStructure() const {
   t.kinds = I->hKind;
   t.childBase = I->hChildBase;
   t.children = I->hChildFlat;
+  t.boards = I->hNodeBoard;
   return t;
 }
 

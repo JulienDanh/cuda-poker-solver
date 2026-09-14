@@ -122,6 +122,11 @@ button:disabled { opacity: .45; cursor: default; }
   border-radius: 14px; padding: 2px 12px; }
 .evchip.p0 { color: #ffd08a; }
 .evchip.p1 { color: #9fd0ff; }
+#runout-strip { margin-top: 10px; }
+.runoutgrid {
+  display: grid; grid-template-columns: repeat(auto-fill, minmax(38px, 1fr));
+  gap: 4px; max-width: 640px;
+}
 
 /* ---- stats ---- */
 .stats { display: flex; flex-wrap: wrap; gap: 20px; }

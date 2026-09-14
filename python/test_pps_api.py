@@ -163,8 +163,7 @@ def test_errors():
 
 
 def test_ui_and_paths():
-    # action-path labels: root, first-street, and a deal edge for
-    # nodes past a chance branch
+    # action-path labels: root, first-street, and card-labeled deal edges
     r = check(client.post("/solvers", json=SPOT), 201)
     sid = r["id"]
     check(client.post(f"/solvers/{sid}/solve", json={"max_iters": 200}))
@@ -172,7 +171,15 @@ def test_ui_and_paths():
     paths = [n["path"] for n in dn["nodes"]]
     assert paths[0] == "(root)"
     assert paths[1].startswith("check"), paths[:4]
-    assert any("deal" in p for p in paths), paths[:10]
+    # deals are card-labeled ("deal 5c"), never bare "deal" or "?"
+    deals = [p for p in paths if "deal" in p]
+    assert deals, paths[:10]
+    for p in deals:
+        for step in p.split(" — "):
+            if step.startswith("deal "):
+                card = step[5:]
+                assert len(card) == 2 and card[0] in "23456789TJQKA" \
+                    and card[1] in "cdhs", (step, p)
     dn2 = check(client.get(f"/solvers/{sid}/decide-nodes?offset=1&limit=1"))
     assert dn2["nodes"][0]["index"] == 1
 
@@ -183,6 +190,31 @@ def test_ui_and_paths():
     assert r.status_code == 200 and "pps" in r.text
     assert client.get("/ui/app.js").status_code == 200
     assert client.get("/ui/style.css").status_code == 200
+    check(client.delete(f"/solvers/{sid}"))
+
+
+def test_runout_branches():
+    # a flop spot: the check-check deal enumerates all turn runouts
+    r = check(client.post("/solvers", json={**SPOT, "board": "Qs9h2d"}), 201)
+    sid = r["id"]
+    check(client.post(f"/solvers/{sid}/solve", json={"max_iters": 100}))
+    nav = check(client.get(f"/solvers/{sid}/node-nav?node=1"))
+    check_act = next(a for a in nav["actions"] if a["kind"] == "check")
+    assert check_act["child_kind"] == "chance"
+    br = check_act["branches"]
+    assert len(br) == 49, len(br)  # 52 - 3 flop cards
+    cards = [b["card"] for b in br]
+    assert "?" not in cards
+    assert "2c" in cards  # card id 0 is a valid deal (no zero-padding bug)
+    assert len(set(cards)) == 49
+    assert sum(1 for b in br if b["next_decide"] is not None) > 40
+    # the dealt cards never collide with the flop board
+    board_cards = {"Qs", "9h", "2d"}
+    assert not (set(cards) & board_cards)
+    # navigating a branch lands on a turn decide node with 4 live cards
+    some = next(b for b in br if b["next_decide"] is not None)
+    ev = check(client.get(f"/solvers/{sid}/node-ev?node={some['next_decide']}"))
+    assert ev["sides"]["oop"]["cards"]
     check(client.delete(f"/solvers/{sid}"))
 
 
@@ -302,10 +334,11 @@ def test_solutions_listing():
 def main():
     for t in (test_health, test_lifecycle, test_one_shot, test_errors,
               test_ui_and_paths, test_node_nav_and_range, test_async_job,
-              test_node_ev_endpoint, test_solutions_listing):
+              test_node_ev_endpoint, test_solutions_listing,
+              test_runout_branches):
         t()
         print(f"  {t.__name__}: ok", file=sys.stderr)
-    print("pps api tests: 9 passed", file=sys.stderr)
+    print("pps api tests: 10 passed", file=sys.stderr)
 
 
 if __name__ == "__main__":

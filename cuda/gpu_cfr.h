@@ -92,6 +92,10 @@ struct TreeStructure {
   std::vector<uint8_t> kinds;
   std::vector<int> childBase;
   std::vector<int> children;
+  // Per-node board cards (5 slots, board[5u..] zero for undealt):
+  // the dealt card of a chance branch is the card present in the
+  // child's board but not the parent's.
+  std::vector<uint8_t> boards;
 };
 
 // Per-node values against the average strategy, in chips (the
