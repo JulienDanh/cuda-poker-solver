@@ -266,12 +266,33 @@ def poll_job(sid, timeout=60.0):
     raise AssertionError("job did not finish in time")
 
 
+def test_node_ev_endpoint():
+    r = check(client.post("/solvers", json=SPOT), 201)
+    sid = r["id"]
+    check(client.post(f"/solvers/{sid}/solve", json={"max_iters": 300}))
+    ev = check(client.get(f"/solvers/{sid}/node-ev?node=0"))
+    st = check(client.get(f"/solvers/{sid}/stats"))
+    assert ev["decider"] == 0
+    assert len(ev["action_ev"]) == len(ev["actions"])
+    assert abs(ev["sides"]["oop"]["agg_ev"] - st["ev_oop"]) < 1e-6
+    assert abs(ev["sides"]["ip"]["agg_ev"] - st["ev_ip"]) < 1e-6
+    for side in ("oop", "ip"):
+        d = ev["sides"][side]
+        assert len(d["cards"]) == len(d["ev"]) == len(d["mass"])
+    # deeper node: decider is IP there
+    ev1 = check(client.get(f"/solvers/{sid}/node-ev?node=1"))
+    assert ev1["decider"] == 1
+    check(client.get(f"/solvers/{sid}/node-ev?node=99999"), 400)
+    check(client.delete(f"/solvers/{sid}"))
+
+
 def main():
     for t in (test_health, test_lifecycle, test_one_shot, test_errors,
-              test_ui_and_paths, test_node_nav_and_range, test_async_job):
+              test_ui_and_paths, test_node_nav_and_range, test_async_job,
+              test_node_ev_endpoint):
         t()
         print(f"  {t.__name__}: ok", file=sys.stderr)
-    print("pps api tests: 7 passed", file=sys.stderr)
+    print("pps api tests: 8 passed", file=sys.stderr)
 
 
 if __name__ == "__main__":

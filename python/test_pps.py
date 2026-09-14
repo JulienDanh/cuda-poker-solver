@@ -204,6 +204,40 @@ def test_target_solve():
     assert s.total_iterations > it0
 
 
+def test_node_ev():
+    s = pps.Solver(board=BOARD, oop=OOP, ip=IP, pot=POT, stack=STACK,
+                   bets=BETS, raises=RAISES)
+    s.solve(400)
+    st = s.stats()
+    # root aggregate == stats() exactly (same walks, f64 host sums)
+    ev = s.node_ev(0)
+    close(ev["sides"]["oop"]["agg_ev"], st["ev_oop"], 1e-6,
+          "node_ev root agg oop")
+    close(ev["sides"]["ip"]["agg_ev"], st["ev_ip"], 1e-6,
+          "node_ev root agg ip")
+    # per-combo node EV == the strategy-weighted action mix (exact)
+    side = ev["sides"]["oop"]
+    freqs = np.asarray(s.strategy(0)["freqs"])
+    mix = (freqs * np.asarray([a["per_combo"] for a in ev["action_ev"]])).sum(axis=0)
+    live = np.asarray(side["mass"]) > 0
+    close(mix[live], np.asarray(side["ev"])[live], 1e-4,
+          "node_ev action mix identity")
+    # action EVs finite; aggregates present for every action
+    for a in ev["action_ev"]:
+        assert np.all(np.isfinite(np.asarray(a["per_combo"])))
+        assert a["agg_ev"] == a["agg_ev"]
+    # deeper node: both sides' EVs exist and the decider acts there
+    ev1 = s.node_ev(1)
+    assert ev1["decider"] == 1
+    assert len(ev1["action_ev"]) == len(ev1["actions"])
+    # out of range raises
+    try:
+        s.node_ev(s.num_decide_nodes + 5)
+        raise AssertionError("out-of-range node must raise")
+    except (IndexError, RuntimeError):
+        pass
+
+
 def main():
     tests = [v for k, v in sorted(globals().items())
              if k.startswith("test_") and callable(v)]

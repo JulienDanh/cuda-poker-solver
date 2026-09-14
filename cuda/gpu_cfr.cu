@@ -715,6 +715,7 @@ struct GpuPostflopSolver::Impl {
   // table, and the compiled spot + bet config (identity of the file).
   std::vector<int> hChildBase, hChildFlat, hComboId, hComboOff0,
       hComboOff1, hNC0, hNC1, sameOther1;
+  std::vector<int> hReachOff0, hReachOff1, hCfvOff;
   std::vector<uint8_t> hKind;
   std::vector<pf::TreeAction> actFlat;
   PostflopSpot spot;
@@ -1794,6 +1795,9 @@ void GpuPostflopSolver::init(const PostflopSpot& spot,
   I->hChildBase = vchildBase;
   I->hChildFlat = cc.childFlat;
   I->hKind.assign(vkind.begin(), vkind.end());
+  I->hReachOff0 = vreachOff0;
+  I->hReachOff1 = vreachOff1;
+  I->hCfvOff = vreachOff;
   I->hComboId = cc.comboId;
   I->hComboOff0 = vcomboOff0;
   I->hComboOff1 = vcomboOff1;
@@ -2303,6 +2307,187 @@ TreeStructure GpuPostflopSolver::treeStructure() const {
   t.childBase = I->hChildBase;
   t.children = I->hChildFlat;
   return t;
+}
+
+NodeEv GpuPostflopSolver::nodeEv(int decideIdx) {
+  Impl* I = impl_;
+  NodeEv out;
+  if (I->empty) throw std::runtime_error("solver compiled to empty ranges");
+  if (decideIdx < 0 || decideIdx >= (int)I->decideMeta.size())
+    throw std::runtime_error("decide node index " +
+                             std::to_string(decideIdx) + " out of range (" +
+                             std::to_string(I->decideMeta.size()) +
+                             " decide nodes)");
+  const auto& m = I->decideMeta[decideIdx];
+  const int u = m.nodeId;
+  const int na = m.na;
+  const int dec = m.player;
+  out.decider = dec;
+  for (int a = 0; a < na; ++a) {
+    const pf::TreeAction& act = I->actFlat[m.actBase + a];
+    out.actions.push_back({act.kind, act.amount});
+  }
+  out.actionEv.assign(na, {});
+
+  // Same-street children (decide/fold/showdown) inherit the node's
+  // combo lists, so the decider's slot i maps to the child's slot i;
+  // a chance child's list is the parent's minus runout-blocked combos,
+  // strictly increasing in base slot, so a binary search maps slots.
+  auto nodeLocalSlot = [&](int offList, int nList, int base) {
+    int lo = 0, hi = nList;
+    while (lo < hi) {
+      const int mid = (lo + hi) / 2;
+      if (I->hComboId[offList + mid] < base) lo = mid + 1;
+      else hi = mid;
+    }
+    return (lo < nList && I->hComboId[offList + lo] == base) ? lo : -1;
+  };
+
+  // One EV walk per traverser; after each walk the cfv rows hold that
+  // traverser's per-combo counterfactual values. The row equals
+  // mass x conditional EV everywhere: the pair-conditional chance
+  // factor (1/(52-nBoard-4) with blocked pairs dropping out) conserves
+  // mass through the deal, so the normalizer is always the reach row.
+  for (int tr = 0; tr < 2; ++tr) {
+    I->halfStep(tr, kModeEV, 1, I->stream);
+    GPU_CHECK(cudaStreamSynchronize(I->stream));
+
+    NodeEv::Side& S = out.side[tr];
+    const int nC = tr == 0 ? I->hNC0[u] : I->hNC1[u];
+    const int off = tr == 0 ? I->hComboOff0[u] : I->hComboOff1[u];
+    S.combos.assign(I->hComboId.begin() + off,
+                    I->hComboId.begin() + off + nC);
+    S.ev.assign(nC, 0.0);
+    S.mass.assign(nC, 0.0);
+
+    // Opponent reach at u: layout tr's row is indexed by the
+    // opponent's node-local combos. Per-combo mass mirrors the
+    // terminal kernels' formula (total minus per-card sums, plus the
+    // identical-combo correction through a node-local slot lookup).
+    const std::vector<double>& wSelf = tr == 0 ? I->w0 : I->w1;
+    const int nOpp = tr == 0 ? I->hNC1[u] : I->hNC0[u];
+    const int offOpp = tr == 0 ? I->hComboOff1[u] : I->hComboOff0[u];
+    const std::vector<uint8_t>& cSelf =
+        tr == 0 ? I->baseCards0 : I->baseCards1;
+    const std::vector<uint8_t>& cOpp =
+        tr == 0 ? I->baseCards1 : I->baseCards0;
+    const std::vector<int>& sameOther =
+        tr == 0 ? I->sameOther0 : I->sameOther1;
+    const float* reachDev =
+        tr == 0 ? I->dReach0 : I->dReach1;
+    const int reachOff = tr == 0 ? I->hReachOff0[u] : I->hReachOff1[u];
+    std::vector<float> reach(nOpp);
+    GPU_CHECK(cudaMemcpy(reach.data(), reachDev + (size_t)reachOff,
+                         (size_t)nOpp * sizeof(float),
+                         cudaMemcpyDeviceToHost));
+    double cardSum[52] = {0.0};
+    double tot = 0.0;
+    for (int j = 0; j < nOpp; ++j) {
+      tot += reach[j];
+      const int base = I->hComboId[offOpp + j];
+      cardSum[cOpp[2 * base]] += reach[j];
+      cardSum[cOpp[2 * base + 1]] += reach[j];
+    }
+    for (int i = 0; i < nC; ++i) {
+      const int base = S.combos[i];
+      double mass = tot - cardSum[cSelf[2 * base]] -
+                    cardSum[cSelf[2 * base + 1]];
+      const int so = sameOther[base];
+      if (so >= 0) {
+        const int slot = nodeLocalSlot(offOpp, nOpp, so);
+        if (slot >= 0) mass += reach[slot];
+      }
+      S.mass[i] = mass;
+      if (mass <= 0.0) mass = 0.0;
+    }
+
+    // The traverser's own row at u (for the non-deciding player this
+    // IS the node EV; for the decider the action mix below is exact).
+    std::vector<float> row(nC);
+    GPU_CHECK(cudaMemcpy(row.data(), I->dCfv + (size_t)I->hCfvOff[u],
+                         (size_t)nC * sizeof(float),
+                         cudaMemcpyDeviceToHost));
+    for (int i = 0; i < nC; ++i)
+      S.ev[i] = S.mass[i] > 0.0 ? (double)row[i] / S.mass[i] : 0.0;
+
+    // Average strategy at u (normalized per combo, like comboStrategy).
+    std::vector<float> srows((size_t)na * nC);
+    GPU_CHECK(cudaMemcpy(srows.data(), I->dStrat + (size_t)m.regOff,
+                         (size_t)na * nC * sizeof(float),
+                         cudaMemcpyDeviceToHost));
+
+    // Decider's per-action EVs: each child row is mass x EV with the
+    // same mass (chance children conserve it through the deal).
+    if (tr == dec) {
+      for (int a = 0; a < na; ++a) {
+        const int ch = I->hChildFlat[I->hChildBase[u] + a];
+        const int nChild = tr == 0 ? I->hNC0[ch] : I->hNC1[ch];
+        const int offChild =
+            tr == 0 ? I->hComboOff0[ch] : I->hComboOff1[ch];
+        const uint8_t kind = I->hKind[ch];
+        std::vector<float> crow(nChild);
+        GPU_CHECK(cudaMemcpy(crow.data(), I->dCfv + (size_t)I->hCfvOff[ch],
+                             (size_t)nChild * sizeof(float),
+                             cudaMemcpyDeviceToHost));
+        out.actionEv[a].perCombo.assign(nC, 0.0);
+        for (int i = 0; i < nC; ++i) {
+          if (S.mass[i] <= 0.0) continue;
+          const int slot = kind == kChance
+              ? nodeLocalSlot(offChild, nChild, S.combos[i])
+              : i;  // same-street children inherit the list
+          if (slot >= 0)
+            out.actionEv[a].perCombo[i] =
+                (double)crow[slot] / S.mass[i];
+        }
+        // action aggregate: range x frequency weighted; a never-used
+        // action (zero total frequency) falls back to the range x mass
+        // weighting so the EV is still displayed
+        double num = 0.0, den = 0.0;
+        double num0 = 0.0, den0 = 0.0;
+        for (int i = 0; i < nC; ++i) {
+          const double mass = S.mass[i];
+          if (mass <= 0.0) continue;
+          double s = 0.0;
+          for (int a2 = 0; a2 < na; ++a2)
+            s += srows[(size_t)a2 * nC + i];
+          const double wBase = wSelf[S.combos[i]] * mass;
+          num0 += wBase * out.actionEv[a].perCombo[i];
+          den0 += wBase;
+          if (s <= 0.0) continue;
+          const double wt =
+              wBase * (double)srows[(size_t)a * nC + i] / s;
+          num += wt * out.actionEv[a].perCombo[i];
+          den += wt;
+        }
+        out.actionEv[a].aggEv =
+            den > 0.0 ? num / den : (den0 > 0.0 ? num0 / den0 : 0.0);
+      }
+      // node per-combo EV from the action mix (exact even past a
+      // chance edge; the raw row agrees up to the deal-branch slice)
+      for (int i = 0; i < nC; ++i) {
+        double s = 0.0;
+        for (int a = 0; a < na; ++a)
+          s += srows[(size_t)a * nC + i];
+        if (s <= 0.0) continue;
+        double ev = 0.0;
+        for (int a = 0; a < na; ++a)
+          ev += (double)srows[(size_t)a * nC + i] / s *
+                out.actionEv[a].perCombo[i];
+        S.ev[i] = ev;
+      }
+    }
+
+    // Range-weighted node EV (equals stats() at the root).
+    double num = 0.0, den = 0.0;
+    for (int i = 0; i < nC; ++i) {
+      if (S.mass[i] <= 0.0) continue;
+      const double wt = wSelf[S.combos[i]] * S.mass[i];
+      num += wt * S.ev[i];
+      den += wt;
+    }
+    S.aggEv = den > 0.0 ? num / den : 0.0;
+  }
+  return out;
 }
 
 // Solution files: self-describing, little-endian. The tree layout is a

@@ -79,6 +79,7 @@
     <div class="panel" id="spot-panel">
       <h2>Spot</h2>
       <div id="big-board" class="bigboard"></div>
+      <div id="node-ev-strip" class="evstrip"></div>
       <div id="history" class="history"></div>
       <div id="nav-actions" class="navactions"></div>
     </div>
@@ -88,14 +89,18 @@
       <button data-tab="combos" class="tab">Combos</button>
       <button data-tab="tree" class="tab">Tree</button>
       <button data-tab="ranges" class="tab">Ranges</button>
-      <button data-tab="ev" class="tab">Root EV</button>
+      <button data-tab="ev" class="tab">EVs</button>
     </nav>
 
     <div class="panel tab-body" id="tab-matrix">
       <div class="mhead">
         <h2 id="strat-title">Strategy — node 0</h2>
-        <div id="legend"></div>
+        <div class="row buttons" style="margin:0">
+          <button class="mini" data-mx="freq">frequencies</button>
+          <button class="mini" data-mx="ev">EVs</button>
+        </div>
       </div>
+      <div id="legend"></div>
       <div id="matrix" class="matrix"></div>
       <div id="cell-detail" class="dim"></div>
     </div>
@@ -128,10 +133,12 @@
     </div>
 
     <div class="panel tab-body hidden" id="tab-ev">
-      <h2>Per-combo root EV (vs average strategy)</h2>
-      <div class="row">
-        <button class="mini" data-evp="oop">OOP</button>
-        <button class="mini" data-evp="ip">IP</button>
+      <div class="mhead">
+        <h2>Per-hand EVs at this node (vs average strategy, chips)</h2>
+        <div class="row buttons" style="margin:0">
+          <button class="mini" data-evp="oop">OOP</button>
+          <button class="mini" data-evp="ip">IP</button>
+        </div>
       </div>
       <div class="tbl-wrap"><table id="ev-table"></table></div>
     </div>

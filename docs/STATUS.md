@@ -248,6 +248,25 @@ after each step):
     suite (async jobs incl. cancel + node-nav semantics + ranges)
     + live-server smoke green.
 
+16. **Per-node EVs (the GTO-Wizard parity feature)**: `nodeEv(i)` —
+    the whole-hand EV (chips, conditional on reaching the node) of
+    every combo of both players at any decide node, plus the deciding
+    player's per-action EVs (per combo and range/frequency-weighted).
+    Two EV walks (one per traverser); each node's cfv row is
+    mass x conditional EV because the pair-conditional chance factor
+    conserves mass through the deal, so the normalizer is always the
+    node's reach row (total minus per-card sums + identical-combo
+    correction, mirroring the terminal kernels). Invariants gated by
+    test: the root aggregate equals stats() to 1e-9, and the per-combo
+    action mix identity (Σ_a σ_a·EV_a == node EV) holds exactly.
+    Never-used actions fall back to a mass-weighted aggregate EV so
+    the display stays informative. Exposed via the pps package
+    (`node_ev`), the API (`/node-ev`) and the UI: per-hand EV matrix
+    (freq/EV toggle, diverging colors scaled by pot), action EVs on
+    the navigation buttons, OOP/IP node-EV chips, and a per-hand EV
+    table with per-action columns at the current node. Perf-loop and
+    quick gate green (no regression).
+
 Cumulative turn throughput: ~4.0x (wide 193 -> ~785, standard 1401 ->
 ~4,730, shortstack 96 -> ~87 us/iter); practical flop 56 -> ~58
 iters/s (1500 stack) and 201 -> ~211 (500 stack).

@@ -383,6 +383,47 @@ class Solver {
     return out;
   }
 
+  // Per-combo EVs of any decide node vs the average strategy, plus
+  // the decider's per-action EVs (chips).
+  py::dict nodeEv(int decideIdx) {
+    pps::gpu::NodeEv ev;
+    std::vector<uint8_t> cards[2];
+    {
+      py::gil_scoped_release rel;
+      ev = solver_->nodeEv(decideIdx);
+      for (int p = 0; p < 2; ++p) cards[p] = solver_->playerCards(p);
+    }
+    py::dict out;
+    out["decider"] = ev.decider;
+    py::list acts;
+    for (const auto& a : ev.actions) acts.append(actionDict(a));
+    out["actions"] = acts;
+    py::list aev;
+    for (const auto& a : ev.actionEv) {
+      py::dict d;
+      d["per_combo"] = toArray(a.perCombo);
+      d["agg_ev"] = a.aggEv;
+      aev.append(d);
+    }
+    out["action_ev"] = aev;
+    const char* names[2] = {"oop", "ip"};
+    py::dict sides;
+    for (int p = 0; p < 2; ++p) {
+      py::dict d;
+      py::list cardList;
+      for (int c : ev.side[p].combos)
+        cardList.append(comboText(cards[p][2 * c], cards[p][2 * c + 1]));
+      d["combos"] = toVectorList(ev.side[p].combos);
+      d["cards"] = cardList;
+      d["ev"] = toArray(ev.side[p].ev);
+      d["mass"] = toArray(ev.side[p].mass);
+      d["agg_ev"] = ev.side[p].aggEv;
+      sides[names[p]] = d;
+    }
+    out["sides"] = sides;
+    return out;
+  }
+
   void save(const std::string& path) const {
     py::gil_scoped_release rel;
     solver_->save(path);
@@ -463,6 +504,7 @@ PYBIND11_MODULE(pps_native, m) {
       .def("decide_nodes", &Solver::decideNodes)
       .def("strategy", &Solver::strategy, py::arg("decide_idx") = 0)
       .def("root_ev", &Solver::rootEv)
+      .def("node_ev", &Solver::nodeEv, py::arg("decide_idx") = 0)
       .def("save", &Solver::save, py::arg("path"))
       .def("player_cards", &Solver::playerCardsList, py::arg("player"))
       .def("player_weights", &Solver::playerWeightsArr, py::arg("player"))

@@ -94,6 +94,30 @@ struct TreeStructure {
   std::vector<int> children;
 };
 
+// Per-node values against the average strategy, in chips (the
+// whole-hand EV of holding each combo at this node, conditional on
+// reaching it). mass is the opponent's reach (range x action
+// frequencies) valid against the combo — the row normalizer, so
+// Σ w*mass*ev / Σ w*mass is the range-weighted node EV (equal to
+// stats() at the root). Action values are exposed for the deciding
+// player only, aligned with side[decider].combos.
+struct NodeEv {
+  struct Side {
+    std::vector<int> combos;   // the player's combos at the node (base slots)
+    std::vector<double> ev;    // per combo, chips (0 where mass == 0)
+    std::vector<double> mass;  // per combo normalizer
+    double aggEv = 0.0;        // range-weighted node EV (chips)
+  };
+  struct ActionEv {
+    std::vector<double> perCombo;  // decider's combos, chips
+    double aggEv = 0.0;            // range- and frequency-weighted EV
+  };
+  int decider = 0;
+  std::vector<ActionLabel> actions;
+  std::vector<ActionEv> actionEv;
+  Side side[2];
+};
+
 class GpuPostflopSolver {
  public:
   // Compiles the spot to device dataflow (tree build + upload).
@@ -165,6 +189,11 @@ class GpuPostflopSolver {
 
   // Per-combo root EVs vs the average strategy (two value walks).
   ComboEv rootEvPerCombo();
+
+  // Per-combo EVs of any decide node vs the average strategy (one
+  // value walk per player), plus the deciding player's per-action
+  // EVs. Runs two full-tree EV walks.
+  NodeEv nodeEv(int decideIdx);
 
   // The base combo lists the solver was compiled with: cards[2*i],
   // cards[2*i+1] is combo slot i of player p's range (board-filtered,

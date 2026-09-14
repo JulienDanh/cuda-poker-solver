@@ -128,6 +128,8 @@ POST   /solvers/{id}/continue      warm-start more iterations
 POST   /solvers/{id}/reset         back to untrained
 GET    /solvers/{id}/stats         EVs + exploitability (fresh walk)
 GET    /solvers/{id}/strategy?node=0       labeled per-combo strategy
+GET    /solvers/{id}/node-ev?node=0        per-hand EVs at a node +
+                                          the decider's per-action EVs
 GET    /solvers/{id}/decide-nodes?offset&limit     tree with action
                                                 paths ("check — bet 150 —
                                                 call — deal — ...")

@@ -92,6 +92,8 @@ let active = null;         // current solver id
 let history = [{ node: 0, label: "(root)", who: 0 }];
 let jobTimer = null;
 let currentStrategy = null;
+let currentEv = null;      // node-ev at the current node
+let matrixMode = "freq";   // "freq" | "ev"
 
 function spotBody() {
   return {
@@ -220,8 +222,9 @@ function comboClass(c) {  // "AhKd" -> {r: hi, c: lo, cls: "AKo"}
 }
 
 function renderMatrix(classes) {
-  // classes: {"AKs": {freqs: [...], n: 2}, ...} or null cells
+  // classes: {"AKs": {freqs, evs, n}, ...}; evs present in EV mode
   const m = $("matrix");
+  const pot = Math.max(1, parseInt($("pot").value, 10) || 1);
   m.innerHTML = "";
   m.appendChild(el("div", "mxh", ""));
   for (const r of RANKS_HIGH) m.appendChild(el("div", "mxh", r));
@@ -230,14 +233,30 @@ function renderMatrix(classes) {
     h.style.display = "flex"; h.style.alignItems = "center";
     m.appendChild(h);
     for (const ci of RANKS_HIGH) {
-      const r = 12 - RANK_VAL[ri], c = 12 - RANK_VAL[ci];
       const suited = ri !== ci && (RANK_VAL[ri] > RANK_VAL[ci]);
       const cls = ri === ci ? ri + ci
         : (suited ? ri + ci + "s" : ci + ri + "o");
       const cell = el("div", "mxcell");
       const d = classes ? classes[cls] : null;
-      if (d && d.n > 0) {
-        // stacked action frequencies as the cell background
+      if (d && d.n > 0 && d.evs && d.evs.length) {
+        // EV mode: diverging color around 0, intensity by EV/pot
+        const mean = d.evs.reduce((a, b) => a + b, 0) / d.evs.length;
+        const ratio = Math.max(-1, Math.min(1, mean / pot));
+        const alpha = (0.12 + 0.72 * Math.abs(ratio)).toFixed(3);
+        cell.style.background = ratio >= 0
+          ? `rgba(62,201,122,${alpha})` : `rgba(255,107,107,${alpha})`;
+        cell.textContent = Math.round(mean);
+        cell.title = `${cls}: EV ${mean.toFixed(1)} (${d.evs.length} live combos)`;
+        cell.onclick = () => {
+          document.querySelectorAll(".mxcell").forEach((x) =>
+            x.classList.remove("sel"));
+          cell.classList.add("sel");
+          $("cell-detail").innerHTML =
+            `<b>${cls}</b> — EV <b>${mean.toFixed(1)}</b> ` +
+            `(mean of ${d.evs.length} live combos)`;
+        };
+      } else if (d && d.n > 0 && !d.evs) {
+        // frequency mode: stacked action frequencies as the background
         const stops = [];
         let acc = 0;
         d.freqs.forEach((f, i) => {
@@ -247,7 +266,6 @@ function renderMatrix(classes) {
         });
         cell.style.background = stops.length
           ? `linear-gradient(90deg, ${stops.join(",")})` : "#0d1016";
-        const dom = d.freqs.indexOf(Math.max(...d.freqs));
         cell.textContent = (Math.max(...d.freqs) * 100).toFixed(0);
         cell.title = d.freqs.map((f, i) =>
           `${d.labels[i]} ${(f * 100).toFixed(1)}%`).join(" | ");
@@ -282,10 +300,16 @@ async function selectNode(idx, step) {
   currentNode = idx;
   const s = await api("GET", `/solvers/${active}/strategy?node=${idx}`);
   const nav = await api("GET", `/solvers/${active}/node-nav?node=${idx}`);
+  let ev = null;
+  try {
+    ev = await api("GET", `/solvers/${active}/node-ev?node=${idx}`);
+  } catch (e) { /* unsolved or empty: EVs unavailable */ }
   currentStrategy = s;
+  currentEv = ev;
   renderSpot(nav);
   renderMatrixFromStrategy(s);
   renderCombosTable(s);
+  renderEvTab();
   $("strat-title").textContent = `Strategy — ${nav.path || "(root)"}`;
 }
 
@@ -321,7 +345,7 @@ function renderSpot(nav) {
     h.appendChild(c);
   });
 
-  // action buttons
+  // action buttons (with per-action EVs when available)
   const na = $("nav-actions");
   na.innerHTML = "";
   nav.actions.forEach((a, i) => {
@@ -329,11 +353,16 @@ function renderSpot(nav) {
     const kindIdx = nav.actions.filter((x, j) => x.kind === a.kind && j <= i).length - 1;
     b.className = "nact";
     b.style.background = kindColor(a.kind, Math.max(0, kindIdx));
-    const sub = a.next_decide == null
-      ? ({ fold: "fold — terminal", showdown: "showdown" }[a.child_kind]
-         || (a.child_kind === "chance" ? "runout — terminal" : "terminal"))
-      : (a.child_kind === "chance" ? "deals next street" : "");
-    b.innerHTML = `${a.label}<small>${sub}</small>`;
+    const parts = [];
+    const ae = currentEv && currentEv.action_ev[i];
+    if (ae && ae.agg_ev != null) parts.push(`EV ${ae.agg_ev.toFixed(1)}`);
+    if (a.next_decide == null) {
+      parts.push({ fold: "terminal", showdown: "terminal",
+        chance: "runout — terminal" }[a.child_kind] || "terminal");
+    } else if (a.child_kind === "chance") {
+      parts.push("deals next street");
+    }
+    b.innerHTML = `${a.label}<small>${parts.join(" · ")}</small>`;
     b.disabled = a.next_decide == null;
     b.onclick = () => {
       if (a.next_decide == null) return;
@@ -344,6 +373,14 @@ function renderSpot(nav) {
     };
     na.appendChild(b);
   });
+
+  // per-player node EV chips
+  if (currentEv && currentEv.sides) {
+    const strip = $("node-ev-strip");
+    strip.innerHTML =
+      `<span class="evchip p0">OOP EV <b>${currentEv.sides.oop.agg_ev.toFixed(1)}</b></span>` +
+      `<span class="evchip p1">IP EV <b>${currentEv.sides.ip.agg_ev.toFixed(1)}</b></span>`;
+  }
 }
 
 function renderMatrixFromStrategy(s) {
@@ -351,17 +388,43 @@ function renderMatrixFromStrategy(s) {
     s.actions.filter((x, j) => x.kind === a.kind && j <= i).length - 1));
   const labels = s.actions.map((a) =>
     a.kind + (a.amount ? " " + a.amount : ""));
-  // per-class unweighted mean of its combos' frequencies
+  // per-class unweighted mean of its combos' frequencies or EVs
+  const evMode = matrixMode === "ev" && currentEv;
+  const dec = currentEv ? currentEv.decider : s.player;
+  const evSide = evMode ? currentEv.sides[dec === 0 ? "oop" : "ip"] : null;
   const classes = {};
   for (let c = 0; c < s.cards.length; c++) {
     const k = comboClass(s.cards[c]).cls;
     if (!classes[k]) {
-      classes[k] = { n: 0,
-        freqs: new Array(s.actions.length).fill(0) };
+      classes[k] = {
+        n: 0, freqs: new Array(s.actions.length).fill(0),
+        evs: [],
+      };
     }
-    classes[k].n++;
+    const d = classes[k];
+    d.n++;
     for (let a = 0; a < s.actions.length; a++)
-      classes[k].freqs[a] += s.freqs[a][c];
+      d.freqs[a] += s.freqs[a][c];
+    if (evSide) {
+      // map strategy combo slot -> ev combo slot by hand text
+      d.evKey = d.evKey || {};
+      d.evKey[s.cards[c]] = c;
+    }
+  }
+  if (evSide) {
+    // node-ev combos align by card text; collect per-class EV values
+    const evByCard = {};
+    evSide.cards.forEach((c, i) => { evByCard[c] = i; });
+    for (const cls in classes) {
+      const d = classes[cls];
+      d.evs = [];
+    }
+    for (let c = 0; c < s.cards.length; c++) {
+      const d = classes[comboClass(s.cards[c]).cls];
+      const i = evByCard[s.cards[c]];
+      if (i != null && evSide.mass[i] > 0)
+        d.evs.push(evSide.ev[i]);
+    }
   }
   for (const cls in classes) {
     const d = classes[cls];
@@ -370,6 +433,7 @@ function renderMatrixFromStrategy(s) {
     d.labels = labels;
   }
   renderMatrix(classes);
+
 
   // legend with range-weighted aggregate where available
   const lg = $("legend");
@@ -492,19 +556,40 @@ async function renderRange(p) {
     `cells show the mean weight of the class's combos (max ${maxw.toFixed(3)})`;
 }
 
-// ---------------- root EV ----------------
-async function renderEv(p) {
-  if (!active) return;
-  const ev = await api("GET", `/solvers/${active}/root-ev`);
-  const d = ev[p];
+// ---------------- node EVs ----------------
+let evSideSel = "oop";
+
+function renderEvTab(p) {
   const t = $("ev-table");
-  let html = "<thead><tr><th>hand</th><th>EV (chips)</th><th>range mass</th></tr></thead><tbody>";
-  const order = d.ev.map((v, i) => [v, i]).sort((a, b) => b[0] - a[0]);
-  for (const [v, i] of order) {
-    const col = v > 0 ? "var(--green)" : "var(--red)";
-    html += `<tr><td class="combo">${d.cards[i]}</td>` +
-      `<td style="color:${col}"><b>${v.toFixed(2)}</b></td>` +
-      `<td>${d.mass[i].toFixed(0)}</td></tr>`;
+  if (!active || !currentEv) { t.innerHTML = ""; return; }
+  const ev = currentEv;
+  const sideName = p || evSideSel || "oop";
+  evSideSel = sideName;
+  const side = ev.sides[sideName];
+  const isDec = (sideName === "oop" ? 0 : 1) === ev.decider;
+  let heads = isDec
+    ? ["hand", "EV"].concat(ev.actions.map((a) =>
+        `${a.kind}${a.amount ? " " + a.amount : ""}`))
+    : ["hand", "EV", "range mass"];
+  let html = "<thead><tr>" + heads.map((h) =>
+    `<th>${h}</th>`).join("") + "</tr></thead><tbody>";
+  const n = side.cards.length;
+  const order = Array.from({ length: n }, (_, i) => i)
+    .sort((a, b) => side.ev[b] - side.ev[a]);
+  for (const i of order) {
+    if (side.mass[i] <= 0) continue;
+    const col = side.ev[i] > 0 ? "var(--green)" : "var(--red)";
+    html += `<tr><td class="combo">${side.cards[i]}</td>` +
+      `<td style="color:${col}"><b>${side.ev[i].toFixed(2)}</b></td>`;
+    if (isDec) {
+      for (let a = 0; a < ev.actions.length; ++a) {
+        const v = ev.action_ev[a].per_combo[i] || 0;
+        html += `<td>${v.toFixed(2)}</td>`;
+      }
+    } else {
+      html += `<td>${side.mass[i].toFixed(0)}</td>`;
+    }
+    html += "</tr>";
   }
   t.innerHTML = html + "</tbody>";
 }
@@ -516,7 +601,7 @@ function switchTab(name) {
   document.querySelectorAll(".tab-body").forEach((t) =>
     t.classList.toggle("hidden", t.id !== "tab-" + name));
   if (name === "tree") renderTree();
-  if (name === "ev") renderEv("oop");
+  if (name === "ev") renderEvTab();
   if (name === "ranges") renderRange("oop");
   if (name === "matrix" && active && !currentStrategy) selectNode(0);
 }
@@ -524,7 +609,15 @@ document.querySelectorAll(".tab").forEach((t) => {
   t.onclick = () => switchTab(t.dataset.tab);
 });
 document.querySelectorAll("[data-evp]").forEach((b) => {
-  b.onclick = () => renderEv(b.dataset.evp);
+  b.onclick = () => renderEvTab(b.dataset.evp);
+});
+document.querySelectorAll("[data-mx]").forEach((b) => {
+  b.onclick = () => {
+    matrixMode = b.dataset.mx;
+    document.querySelectorAll("[data-mx]").forEach((x) =>
+      x.classList.toggle("active", x.dataset.mx === matrixMode));
+    if (currentStrategy) renderMatrixFromStrategy(currentStrategy);
+  };
 });
 document.querySelectorAll("[data-rp]").forEach((b) => {
   b.onclick = () => renderRange(b.dataset.rp);

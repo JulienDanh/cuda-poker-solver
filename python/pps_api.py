@@ -519,6 +519,17 @@ def solver_root_ev(sid: str) -> Dict[str, Any]:
     return _jsonable(ev)
 
 
+@app.get("/solvers/{sid}/node-ev")
+def solver_node_ev(sid: str, node: int = Query(0, ge=0)) -> Dict[str, Any]:
+    """Per-combo EVs of decide node `node` against the average strategy,
+    both players (whole-hand EV in chips, conditional on reaching the
+    node), plus the deciding player's per-action EVs."""
+    e = REGISTRY.get(sid)
+    with e.lock:
+        ev = _engine(e.solver.node_ev, node)
+    return _jsonable(ev)
+
+
 @app.post("/solvers/{sid}/save")
 def solver_save(sid: str, p: SaveParams) -> Dict[str, Any]:
     e = REGISTRY.get(sid)
