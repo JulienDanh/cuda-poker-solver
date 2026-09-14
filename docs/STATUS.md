@@ -75,7 +75,15 @@ a redundant middle rung. Its bet-tree construction lives on as
 | wide (1500 stack, 4 sizes) | 11,716,550 | 14 | 49.6 s | 1747 ms/iter (0.57/s) | ~150 ms/iter (~0.65/s) | ~0.9x |
 
 Parity holds on both (EV diff 0.0008 at 200 iters standard; 0.0018 at
-100 iters wide). The wide flop fits in ~1.5 GB VRAM. Two flop-specific
+100 iters wide). The practical abstraction (one size + all-in,
+e.g. "0.75,a", raises 2.5x/3x) is much smaller and the GPU keeps its
+edge everywhere: turn 500 stack 2,085 nodes at 6,697 iters/s vs oracle
+~1,563 (4.3x); turn 1500 stack 5,943 nodes at 4,283 vs ~657 (6.5x);
+flop 500 stack 164k nodes at 201 vs ~40 (5.0x); flop 1500 stack 615k
+nodes at 56 vs ~11.8 (4.7x). End-to-end at low iteration counts the
+GPU's compile floor (0.2 s turn, 1.6-2.7 s flop) eats into it: 1.1-2.4x
+turn, 2.4-3.1x flop. The wide-flop weakness below only bites with
+multi-size abstractions. The wide flop fits in ~1.5 GB VRAM. Two flop-specific
 findings: the GPU's node throughput drops ~6x vs the turn trees (39M
 -> 6.7M nodes/s) because chance-dealt flop trees are showdown-heavy
 (~600k showdown nodes per iteration over ~1,900 runout boards), and
