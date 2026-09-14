@@ -119,10 +119,14 @@ function showStats(st, extra) {
 }
 
 // ---------------- solve (background job) ----------------
+let jobSid = null;   // the solver the running job belongs to
+
 async function startJob(path, body) {
   try {
-    const r = await api("POST", `/solvers/${active}/${path}`,
-      { ...body, wait: false }, path === "solve" && body.fresh);
+    const sid = active;
+    const r = await api("POST", `/solvers/${sid}/${path}`,
+      { ...body, wait: false });
+    jobSid = sid;
     $("progress").classList.remove("hidden");
     clearInterval(jobTimer);
     jobTimer = setInterval(pollJob, 500);
@@ -131,13 +135,14 @@ async function startJob(path, body) {
 }
 
 async function pollJob() {
-  if (!active) return;
+  if (!jobSid) return;
   let meta;
   try {
-    meta = await api("GET", `/solvers/${active}`);
+    meta = await api("GET", `/solvers/${jobSid}`);
   } catch (e) { return; }
   const job = meta.job;
-  if (!job) { clearInterval(jobTimer); $("progress").classList.add("hidden"); return; }
+  if (!job) { clearInterval(jobTimer); jobSid = null;
+    $("progress").classList.add("hidden"); return; }
   const pct = job.total ? Math.min(100, 100 * job.done / job.total) : 0;
   $("bar-fill").style.width = pct.toFixed(1) + "%";
   $("progress-text").textContent =
@@ -145,9 +150,10 @@ async function pollJob() {
     `${job.error ? " — " + job.error : ""}`;
   if (!job.running) {
     clearInterval(jobTimer);
+    jobSid = null;
     $("progress").classList.add("hidden");
     if (job.status === "error") err("stats")(new Error(job.error));
-    else {
+    else if (active === meta.id) {
       const st = await api("GET", `/solvers/${active}/stats`);
       showStats(st, `<div class="stat"><div class="v">${meta.total_iterations}</div><div class="k">iters total</div></div>`);
       await selectNode(history[history.length - 1].node);
@@ -655,16 +661,19 @@ $("delete-btn").onclick = async () => {
 };
 $("save-btn").onclick = async () => {
   if (!active) return;
-  const name = prompt("solution file name:", "spot.sol");
-  if (!name) return;
+  const name = ($("sol-name").value || "").trim() ||
+    ($("sol-files").value || "").trim();
+  if (!name) return err("stats")(new Error("enter a solution name"));
   try {
     const r = await api("POST", `/solvers/${active}/save`, { name });
     $("stats").innerHTML = `saved ${name} (${r.bytes} bytes)`;
+    await refreshFiles();
   } catch (e) { err("stats")(e); }
 };
 $("load-btn").onclick = async () => {
-  const name = prompt("solution file name:", "spot.sol");
-  if (!name) return;
+  const name = ($("sol-files").value || "").trim() ||
+    ($("sol-name").value || "").trim();
+  if (!name) return err("stats")(new Error("pick or enter a file name"));
   try {
     const r = await api("POST", "/solvers/load", { name }, true);
     active = r.id;
@@ -675,6 +684,26 @@ $("load-btn").onclick = async () => {
     await selectNode(0);
   } catch (e) { err("stats")(e); }
 };
+
+async function refreshFiles() {
+  try {
+    const r = await api("GET", "/solutions");
+    const sel = $("sol-files");
+    const cur = sel.value;
+    sel.innerHTML = "";
+    if (!r.solutions.length) {
+      sel.innerHTML = "<option value=''>no saved solutions</option>";
+      return;
+    }
+    for (const f of r.solutions) {
+      const o = document.createElement("option");
+      o.value = f.name;
+      o.textContent = `${f.name} (${(f.bytes / 1048576).toFixed(1)} MB)`;
+      sel.appendChild(o);
+    }
+    if (cur) sel.value = cur;
+  } catch (e) { /* listing is best-effort */ }
+}
 $("node-filter").addEventListener("input", () => renderTree());
 $("tree-prev").onclick = () => { if (treePage > 0) { treePage--; renderTree(); } };
 $("tree-next").onclick = () => { treePage++; renderTree(); };
@@ -689,4 +718,5 @@ $("tree-next").onclick = () => { treePage++; renderTree(); };
     $("conn").textContent = `ok — up to ${h.max_solvers} solvers`;
   } catch (e) { $("conn").textContent = "offline"; }
   await refreshSolvers();
+  await refreshFiles();
 })();

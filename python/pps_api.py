@@ -102,7 +102,7 @@ class LoadParams(BaseModel):
 
 class _Entry:
     __slots__ = ("solver", "lock", "created", "last_used", "board", "paths",
-                 "tree", "decide_idx", "job")
+                 "tree", "decide_idx", "job", "nodes")
 
     def __init__(self, solver: Solver, board: str):
         self.solver = solver
@@ -114,6 +114,7 @@ class _Entry:
         self.tree = None    # cached tree structure (kinds + CSR children)
         self.decide_idx = None  # node_id -> decide index
         self.job = None     # async solve job dict while running
+        self.nodes = None    # cached decide-node dicts (static tree)
 
 
 class Registry:
@@ -212,8 +213,10 @@ def _node_paths(e: "_Entry") -> List[str]:
     Child node ids are always greater than their parent's (the tree
     builder allocates parents first), so one forward pass works.
     Decide edges carry their action label; chance edges are the deal.
-    Also caches the tree structure and the node_id -> decide index map
-    for node-nav.
+    Also caches the tree structure, the node_id -> decide index map
+    and the full decide-node list (static tree) for the listing
+    endpoint — a flop tree has tens of thousands of decide nodes and
+    must not be rebuilt per pagination request.
     """
     if e.paths is not None:
         return e.paths
@@ -243,6 +246,7 @@ def _node_paths(e: "_Entry") -> List[str]:
     e.paths = paths
     e.tree = tree
     e.decide_idx = {d["node_id"]: d["index"] for d in dns}
+    e.nodes = dns
     return paths
 
 
@@ -449,14 +453,13 @@ def solver_strategy(sid: str, node: int = Query(0, ge=0)) -> Dict[str, Any]:
 def solver_decide_nodes(sid: str, offset: int = Query(0, ge=0),
                         limit: int = Query(200, gt=0, le=2000)) -> Dict[str, Any]:
     e = REGISTRY.get(sid)
-    with e.lock:
-        total = e.solver.num_decide_nodes
-        nodes = _engine(e.solver.decide_nodes)
-    paths = _node_paths(e)
-    for d in nodes:
-        d["path"] = paths[d["node_id"]] or "(root)"
-    return {"total": total,
-            "nodes": nodes[offset:offset + limit]}
+    _node_paths(e)  # builds/caches the node list once (static tree)
+    nodes = e.nodes
+    out = []
+    for d in nodes[offset:offset + limit]:
+        d["path"] = e.paths[d["node_id"]] or "(root)"
+        out.append(d)
+    return {"total": len(nodes), "nodes": out}
 
 
 @app.get("/solvers/{sid}/node-nav")
@@ -467,9 +470,8 @@ def solver_node_nav(sid: str, node: int = Query(0, ge=0)) -> Dict[str, Any]:
     showdown are terminal; an all-in runout may reach no decide node).
     Drives the UI's action-history bar."""
     e = REGISTRY.get(sid)
-    _node_paths(e)  # builds/caches tree + decide index too
-    with e.lock:
-        dns = _engine(e.solver.decide_nodes)
+    _node_paths(e)  # builds/caches tree + node list
+    dns = e.nodes
     if node >= len(dns):
         raise HTTPException(400, f"decide node {node} out of range")
     d = dns[node]
@@ -549,6 +551,18 @@ def solver_load(p: LoadParams) -> Dict[str, Any]:
     out = _solver_meta(sid, REGISTRY.get(sid))
     out["name"] = p.name
     return _jsonable(out)
+
+
+@app.get("/solutions")
+def list_solutions() -> Dict[str, Any]:
+    """Saved solution files available in the data dir."""
+    os.makedirs(DATA_DIR, exist_ok=True)
+    out = []
+    for name in sorted(os.listdir(DATA_DIR)):
+        p = os.path.join(DATA_DIR, name)
+        if os.path.isfile(p):
+            out.append({"name": name, "bytes": os.path.getsize(p)})
+    return {"data_dir": DATA_DIR, "solutions": out}
 
 
 class OneShot(SpotSpec, SolveParams):

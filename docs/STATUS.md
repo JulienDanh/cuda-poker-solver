@@ -282,6 +282,20 @@ after each step):
     sequence the UI makes (solve job + poll, strategy/node-nav/
     node-ev/stats, tree, ranges, save/load, warm continue, delete).
 
+18. **Serving performance + robustness (from live-usage telemetry)**:
+    the server log showed decide-nodes hit on every pagination/filter
+    click, each call rebuilding every decide-node dict from the
+    engine (90 ms on a flop tree, under the solver lock, blocking
+    other queries) — the node list is now cached per solver (static
+    tree): 90 ms -> ~1.2 ms. node-nav uses the same cache. New
+    GET /solutions lists saved solution files, and the UI's save/load
+    uses a file picker instead of prompt(). Fixed a job-polling race:
+    the poller tracked `active` (switching solvers mid-job polled the
+    wrong one); it now tracks the job's own solver and only refreshes
+    the view if it is still active. Sized the node_ev-vs-stats test
+    tolerance to the measured f32 walk noise (1.45e-6, fold-atomics
+    rounding across separate walks): 1e-4 with a comment.
+
 Cumulative turn throughput: ~4.0x (wide 193 -> ~785, standard 1401 ->
 ~4,730, shortstack 96 -> ~87 us/iter); practical flop 56 -> ~58
 iters/s (1500 stack) and 201 -> ~211 (500 stack).

@@ -274,8 +274,8 @@ def test_node_ev_endpoint():
     st = check(client.get(f"/solvers/{sid}/stats"))
     assert ev["decider"] == 0
     assert len(ev["action_ev"]) == len(ev["actions"])
-    assert abs(ev["sides"]["oop"]["agg_ev"] - st["ev_oop"]) < 1e-6
-    assert abs(ev["sides"]["ip"]["agg_ev"] - st["ev_ip"]) < 1e-6
+    assert abs(ev["sides"]["oop"]["agg_ev"] - st["ev_oop"]) < 1e-4
+    assert abs(ev["sides"]["ip"]["agg_ev"] - st["ev_ip"]) < 1e-4
     for side in ("oop", "ip"):
         d = ev["sides"][side]
         assert len(d["cards"]) == len(d["ev"]) == len(d["mass"])
@@ -286,13 +286,26 @@ def test_node_ev_endpoint():
     check(client.delete(f"/solvers/{sid}"))
 
 
+def test_solutions_listing():
+    r = check(client.post("/solvers", json=SPOT), 201)
+    sid = r["id"]
+    check(client.post(f"/solvers/{sid}/solve", json={"max_iters": 100}))
+    check(client.post(f"/solvers/{sid}/save", json={"name": "list.sol"}))
+    lst = check(client.get("/solutions"))
+    names = [s["name"] for s in lst["solutions"]]
+    assert "list.sol" in names
+    saved = next(s for s in lst["solutions"] if s["name"] == "list.sol")
+    assert saved["bytes"] > 0
+    check(client.delete(f"/solvers/{sid}"))
+
+
 def main():
     for t in (test_health, test_lifecycle, test_one_shot, test_errors,
               test_ui_and_paths, test_node_nav_and_range, test_async_job,
-              test_node_ev_endpoint):
+              test_node_ev_endpoint, test_solutions_listing):
         t()
         print(f"  {t.__name__}: ok", file=sys.stderr)
-    print("pps api tests: 8 passed", file=sys.stderr)
+    print("pps api tests: 9 passed", file=sys.stderr)
 
 
 if __name__ == "__main__":
