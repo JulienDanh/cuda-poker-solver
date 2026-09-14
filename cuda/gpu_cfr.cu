@@ -51,7 +51,7 @@ enum Mode : int { kModeCFR = 0, kModeEV = 1, kModeBR = 2 };
 enum Kind : uint8_t { kDecide = 0, kShowdown = 1, kFold = 2, kChance = 3 };
 
 // ---------------------------------------------------------------------------
-// Block primitives (fp64).
+// Block primitives (f32; one node per block — see bwdDepthK).
 // ---------------------------------------------------------------------------
 
 __device__ __forceinline__ float warpInclScan(float v, int lane) {
@@ -219,13 +219,10 @@ __global__ void advanceCounterK(int* counter) {
 // ---------------------------------------------------------------------------
 
 // DECIDE nodes at one depth (children share the parent's combo lists).
-__global__ void fwdDecideK(const int* __restrict__ nodes, int count, int tr,
-                          int sigSrc, TreeBuf b) {
-  if (blockIdx.x >= count) return;
-  const int node = nodes[blockIdx.x];
+__device__ __forceinline__ void fwdDecideBlock(int node, int c, int tr,
+                                               int sigSrc, TreeBuf b) {
   const int opp = 1 - tr;
   const int nOppNode = nOfP(b, node, opp);
-  const int c = blockIdx.y * kThreads + threadIdx.x;
   if (c >= nOppNode) return;
   const int comboOff = comboOffP(b, node, opp);
   const int baseId = b.comboId[comboOff + c];
@@ -266,13 +263,10 @@ __global__ void fwdDecideK(const int* __restrict__ nodes, int count, int tr,
   }
 }
 
-// CHANCE nodes at one depth: reach masked and compacted through each
+// One branch of a CHANCE node: reach masked and compacted through the
 // board branch (opponent combo space).
-__global__ void fwdChanceK(const int* __restrict__ nodes, int count,
-                          int maxBranch, int tr, TreeBuf b) {
-  if (blockIdx.x >= count) return;
-  const int node = nodes[blockIdx.x];
-  const int br = blockIdx.y;
+__device__ __forceinline__ void fwdChanceBlock(int node, int br, int tr,
+                                               TreeBuf b) {
   const int nb = b.nBranch[node];
   if (br >= nb) return;
   const int p = 1 - tr;
@@ -297,6 +291,37 @@ __global__ void fwdChanceK(const int* __restrict__ nodes, int count,
     b.reachRW[(size_t)b.reachOff[child] + j] =
         b.reach[(size_t)b.reachOff[node] + parentSlot] * inv;
   }
+}
+
+// Whole forward level: decide nodes and chance nodes at one depth in a
+// single flat launch (they are independent — both read depth-d reach
+// and write disjoint children at d+1), halving the forward graph
+// nodes. Blocks below nD*gy are decide (node = flat/gy, one combo per
+// thread); the rest are chance (node, branch) pairs located by binary
+// search over the per-depth branch prefix table.
+__global__ void fwdLevelK(const int* __restrict__ dlist, int nD,
+                          const int* __restrict__ clist, int nC, int gy,
+                          const int* __restrict__ cBrOff, int tr, int sigSrc,
+                          TreeBuf b) {
+  const int flat = blockIdx.x;
+  if (flat < nD * gy) {
+    const int node = dlist[flat / gy];
+    const int c = (flat % gy) * kThreads + threadIdx.x;
+    fwdDecideBlock(node, c, tr, sigSrc, b);
+    return;
+  }
+  const int f2 = flat - nD * gy;
+  int lo = 0, hi = nC;
+  while (lo < hi) {
+    const int mid = (lo + hi) / 2;
+    if (cBrOff[mid] <= f2)
+      lo = mid + 1;
+    else
+      hi = mid;
+  }
+  if (lo <= 0 || lo > nC) return;
+  const int ci = lo - 1;
+  fwdChanceBlock(clist[ci], f2 - cBrOff[ci], tr, b);
 }
 
 // ---------------------------------------------------------------------------
@@ -394,14 +419,15 @@ __device__ void foldNode(int node, int tr, TreeBuf b) {
   // reads the same reach row through the per-node foldSon map.
   if (threadIdx.x < 52) cardSum[threadIdx.x] = 0.0f;
   __syncthreads();
+  float tot = 0.0f;
   for (int j = threadIdx.x; j < nOppNode; j += blockDim.x) {
+    const float rj = r[j];
+    tot += rj;
     const int baseId = b.comboId[comboOff + j];
-    atomicAdd(&cardSum[cardsOpp[2 * baseId]], r[j]);
-    atomicAdd(&cardSum[cardsOpp[2 * baseId + 1]], r[j]);
+    atomicAdd(&cardSum[cardsOpp[2 * baseId]], rj);
+    atomicAdd(&cardSum[cardsOpp[2 * baseId + 1]], rj);
   }
   __syncthreads();
-  float tot = 0.0f;
-  for (int j = threadIdx.x; j < nOppNode; j += blockDim.x) tot += r[j];
   tot = blockReduceSum(tot);
   __syncthreads();
   const int fb = b.foldBy[node];
@@ -528,12 +554,17 @@ __device__ void chanceNodeBwd(int node, int tr, TreeBuf b) {
   }
 }
 
+// kindMask: profiling attribution only — blocks whose node kind is not
+// in the mask return early (-1 = all kinds). Production launches pass
+// -1; the graph never contains masked launches.
 __global__ void bwdDepthK(const int* __restrict__ nodes, int count, int tr,
                          int mode, const float* __restrict__ coefTab,
-                         const int* __restrict__ counter, TreeBuf b) {
+                         const int* __restrict__ counter, int kindMask,
+                         TreeBuf b) {
   if (blockIdx.x >= count) return;
   const int node = nodes[blockIdx.x];
   const int kind = b.kind[node];
+  if (kindMask >= 0 && ((1 << kind) & kindMask) == 0) return;
   const int nOppBase = (1 - tr) == 0 ? b.n0Base : b.n1Base;
   extern __shared__ float sh[];
   if (kind == kShowdown) {
@@ -657,8 +688,10 @@ struct GpuPostflopSolver::Impl {
   int* dCounterDummy = nullptr;
   bool capturing = false;
 
-  std::vector<int*> dDecideList, dChanceList, dBwdList;
-  std::vector<int> decideCount, chanceCount, bwdCount, maxBranchAtDepth;
+  std::vector<int*> dDecideList, dChanceList, dBwdList, dChanceBrOff;
+  std::vector<int> decideCount, chanceCount, bwdCount, chanceBrTotal;
+  // per depth: [decide, showdown, fold, chance] node counts (profiling)
+  std::vector<std::array<int, 4>> depthKinds;
 
   // host copies for stats
   std::vector<double> w0, w1;
@@ -747,27 +780,24 @@ struct GpuPostflopSolver::Impl {
     const int* counter = mode == kModeCFR ? dCounter : dCounterDummy;
     const int maxBase = std::max(n0Base, n1Base);
     const size_t smem = (size_t)2 * maxBase * sizeof(float);
-    // Forward: decide and chance kernels at one depth both write the
-    // reach of depth d+1; they must be ordered with the depths (a depth
-    // d+1 decide node reads the chance writes from depth d).
+    const int gy = (maxBase + kThreads - 1) / kThreads;
+    // Forward: one flat launch per depth covering both node kinds (they
+    // are independent; both read depth-d reach and write disjoint
+    // children at d+1). Depth levels stay ordered: a depth d+1 decide
+    // node reads the chance writes from depth d.
     for (int d = 0; d <= maxDepth; ++d) {
-      if (decideCount[d] > 0) {
-        const dim3 g(decideCount[d], (maxBase + kThreads - 1) / kThreads);
-        fwdDecideK<<<g, kThreads, 0, s>>>(dDecideList[d], decideCount[d],
-                                          tr, sigSrc, b);
-        GPU_CHECK(cudaGetLastError());
-      }
-      if (chanceCount[d] > 0) {
-        const dim3 g(chanceCount[d], maxBranchAtDepth[d]);
-        fwdChanceK<<<g, kThreads, 0, s>>>(dChanceList[d], chanceCount[d],
-                                          maxBranchAtDepth[d], tr, b);
-        GPU_CHECK(cudaGetLastError());
-      }
+      const int nD = decideCount[d], nC = chanceCount[d];
+      if (nD == 0 && nC == 0) continue;
+      const dim3 g(nD * gy + chanceBrTotal[d]);
+      fwdLevelK<<<g, kThreads, 0, s>>>(dDecideList[d], nD, dChanceList[d],
+                                      nC, gy, dChanceBrOff[d], tr, sigSrc,
+                                      b);
+      GPU_CHECK(cudaGetLastError());
     }
     for (int d = maxDepth; d >= 0; --d) {
       if (bwdCount[d] > 0) {
         bwdDepthK<<<bwdCount[d], kThreads, smem, s>>>(
-            dBwdList[d], bwdCount[d], tr, mode, coefTab, counter, b);
+            dBwdList[d], bwdCount[d], tr, mode, coefTab, counter, -1, b);
         GPU_CHECK(cudaGetLastError());
       }
     }
@@ -893,9 +923,11 @@ struct GpuPostflopSolver::Impl {
     for (auto* p : dDecideList) cudaFree(p);
     for (auto* p : dChanceList) cudaFree(p);
     for (auto* p : dBwdList) cudaFree(p);
+    for (auto* p : dChanceBrOff) cudaFree(p);
     dDecideList.clear();
     dChanceList.clear();
     dBwdList.clear();
+    dChanceBrOff.clear();
     if (exec) {
       cudaGraphExecDestroy(exec);
       exec = nullptr;
@@ -1276,9 +1308,11 @@ GpuPostflopSolver::GpuPostflopSolver(const PostflopSpot& spot,
   I->maxDepth = D - 1;
   maxDepth_ = I->maxDepth;
   std::vector<std::vector<int>> decideList(D), chanceList(D), bwdList(D);
+  I->depthKinds.assign(D, {0, 0, 0, 0});
   for (int u = 0; u < I->numNodes; ++u) {
     const NodeH& nd = cc.nodes[u];
     bwdList[nd.depth].push_back(u);
+    ++I->depthKinds[nd.depth][nd.kind];
     if (nd.kind == kDecide)
       decideList[nd.depth].push_back(u);
     else if (nd.kind == kChance)
@@ -1293,20 +1327,25 @@ GpuPostflopSolver::GpuPostflopSolver(const PostflopSpot& spot,
   I->dDecideList.resize(D, nullptr);
   I->dChanceList.resize(D, nullptr);
   I->dBwdList.resize(D, nullptr);
+  I->dChanceBrOff.resize(D, nullptr);
   I->decideCount.resize(D);
   I->chanceCount.resize(D);
   I->bwdCount.resize(D);
-  I->maxBranchAtDepth.assign(D, 1);
+  I->chanceBrTotal.assign(D, 0);
   for (int d = 0; d < D; ++d) {
     I->decideCount[d] = (int)decideList[d].size();
     I->chanceCount[d] = (int)chanceList[d].size();
     I->bwdCount[d] = (int)bwdList[d].size();
-    int mb = 1;
-    for (int u : chanceList[d]) mb = std::max(mb, cc.nodes[u].nBranch);
-    I->maxBranchAtDepth[d] = mb;
+    // Per-depth (chance node, branch) prefix table for the fused
+    // forward launch: blocks past the decide section binary-search it.
+    std::vector<int> brOff(1, 0);
+    for (int u : chanceList[d]) brOff.push_back(brOff.back() +
+                                                cc.nodes[u].nBranch);
+    I->chanceBrTotal[d] = brOff.back();
     upload(I->dDecideList[d], decideList[d]);
     upload(I->dChanceList[d], chanceList[d]);
     upload(I->dBwdList[d], bwdList[d]);
+    upload(I->dChanceBrOff[d], brOff);
   }
 
   // Flat node arrays.
@@ -1660,6 +1699,95 @@ void GpuPostflopSolver::solve(int iterations, const std::string& algo,
   GPU_CHECK(cudaMalloc(&I->dCounter, sizeof(int)));
   GPU_CHECK(cudaMemset(I->dCounter, 0, sizeof(int)));
 
+  if (iterations > 0 && std::getenv("GPU_CFR_PROFILE")) {
+    // Manual timed iterations instead of the graph: per-depth CUDA
+    // event timings for the forward and backward launches, capped so
+    // the run stays quick. The per-launch sync serializes work, so
+    // absolute times are inflated on launch-bound trees; kernel
+    // durations and their ratios are what to read. Shares the launch
+    // sequence with halfStep.
+    const int pit = std::min(iterations, 64);
+    cudaEvent_t ev0, ev1;
+    GPU_CHECK(cudaEventCreate(&ev0));
+    GPU_CHECK(cudaEventCreate(&ev1));
+    const int D = I->maxDepth + 1;
+    std::vector<double> fwdT(2 * D, 0.0), bwdT(2 * D, 0.0);
+    // per (tr, depth, kind) bwd attribution, kind in {show, fold,
+    // decide+chance}
+    std::vector<double> bwdK(2 * D * 3, 0.0);
+    const TreeBuf b = I->buf();
+    const int maxBase = std::max(I->n0Base, I->n1Base);
+    const size_t smem = (size_t)2 * maxBase * sizeof(float);
+    const int gy = (maxBase + kThreads - 1) / kThreads;
+    auto timed = [&](bool fwd, int tr, int d, int kmIdx, int mask) {
+      GPU_CHECK(cudaEventRecord(ev0, s));
+      if (fwd) {
+        const int nD = I->decideCount[d], nC = I->chanceCount[d];
+        const dim3 g(nD * gy + I->chanceBrTotal[d]);
+        fwdLevelK<<<g, kThreads, 0, s>>>(I->dDecideList[d], nD,
+                                         I->dChanceList[d], nC, gy,
+                                         I->dChanceBrOff[d], tr, 0, b);
+      } else {
+        bwdDepthK<<<I->bwdCount[d], kThreads, smem, s>>>(
+            I->dBwdList[d], I->bwdCount[d], tr, kModeCFR, I->dCoefTab,
+            I->dCounter, mask, b);
+      }
+      GPU_CHECK(cudaEventRecord(ev1, s));
+      GPU_CHECK(cudaEventSynchronize(ev1));
+      float ms;
+      GPU_CHECK(cudaEventElapsedTime(&ms, ev0, ev1));
+      if (kmIdx < 0)
+        (fwd ? fwdT : bwdT)[tr * D + d] += ms * 1000.0;
+      else
+        bwdK[tr * D * 3 + d * 3 + kmIdx] += ms * 1000.0;
+    };
+    // kind masks: bit per Kind (kDecide=0, kShowdown=1, kFold=2,
+    // kChance=3); the attribution classes are show, fold, decide+chance.
+    const int kKindMask[3] = {1 << kShowdown, 1 << kFold,
+                              (1 << kDecide) | (1 << kChance)};
+    for (int t = 0; t < pit; ++t) {
+      for (int tr = 0; tr < 2; ++tr) {
+        for (int d = 0; d < D; ++d)
+          if (I->decideCount[d] > 0 || I->chanceCount[d] > 0)
+            timed(true, tr, d, -1, -1);
+        for (int d = I->maxDepth; d >= 0; --d) {
+          if (I->bwdCount[d] > 0) {
+            timed(false, tr, d, -1, -1);
+            for (int km = 0; km < 3; ++km)
+              timed(false, tr, d, km, kKindMask[km]);
+          }
+        }
+      }
+      advanceCounterK<<<1, 1, 0, s>>>(I->dCounter);
+    }
+    GPU_CHECK(cudaStreamSynchronize(s));
+    cudaEventDestroy(ev0);
+    cudaEventDestroy(ev1);
+    for (int d = 0; d < D; ++d) {
+      const auto& k = I->depthKinds[d];
+      std::fprintf(stderr,
+                   "gpu_cfr: d%-2d decide=%-5d show=%-5d fold=%-5d "
+                   "chance=%-3d  fwd %6.1f/%6.1f us  bwd %6.1f/%6.1f us"
+                   "  [show %5.1f  fold %5.1f  decide %5.1f]\n",
+                   d, k[0], k[1], k[2], k[3], fwdT[0 * D + d] / pit,
+                   fwdT[1 * D + d] / pit, bwdT[0 * D + d] / pit,
+                   bwdT[1 * D + d] / pit, bwdK[0 * D * 3 + d * 3 + 0] / pit,
+                   bwdK[0 * D * 3 + d * 3 + 1] / pit,
+                   bwdK[0 * D * 3 + d * 3 + 2] / pit);
+    }
+    double ft = 0.0, bt = 0.0;
+    for (int i = 0; i < 2 * D; ++i) {
+      ft += fwdT[i];
+      bt += bwdT[i];
+    }
+    std::fprintf(stderr,
+                 "gpu_cfr: per-iter (serialized) fwd %.1f us  bwd %.1f us "
+                 "over %d iters\n",
+                 ft / pit, bt / pit, pit);
+    iterationsRun_ = pit;
+    return;
+  }
+
   if (iterations > 0) {
     I->capturing = true;
     GPU_CHECK(cudaStreamBeginCapture(s, cudaStreamCaptureModeGlobal));
@@ -1669,6 +1797,11 @@ void GpuPostflopSolver::solve(int iterations, const std::string& algo,
     GPU_CHECK(cudaStreamEndCapture(s, &I->graph));
     I->capturing = false;
     GPU_CHECK(cudaGraphInstantiate(&I->exec, I->graph, nullptr, nullptr, 0));
+    {
+      size_t nn = 0;
+      cudaGraphGetNodes(I->graph, nullptr, &nn);
+      std::fprintf(stderr, "gpu_cfr: graph nodes=%zu\n", nn);
+    }
     // Replay in chunks; with a target set, check the exploitability
     // (two BR walks, ~4 iteration-equivalents) after each chunk and
     // stop early once it crosses the target. The walks never touch the

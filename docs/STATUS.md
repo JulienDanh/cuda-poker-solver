@@ -63,9 +63,9 @@ a redundant middle rung. Its bet-tree construction lives on as
 
 | spot | nodes | compile | solve | iters/s |
 |---|---|---|---|---|
-| shortstack (all-in runout) | 537 | ~195 ms | 94 us/iter | ~10,600 |
+| shortstack (all-in runout) | 537 | ~195 ms | 89 us/iter | ~11,240 |
 | standard (200 pot, 500 stack) | 5,943 | ~205 ms | 215 us/iter | ~4,650 |
-| wide/deep (1500 stack, 4+ sizes) | 51,903 | ~230 ms | ~1,310 us/iter | ~735-795 |
+| wide/deep (1500 stack, 4+ sizes) | 51,903 | ~230 ms | ~1,240-1,340 us/iter | ~747-807 |
 
 Per-iteration cost is dominated by the solve replay; compile is a fixed
 ~200 ms (mostly CUDA context init on WSL); the stats walk is single-digit
@@ -97,9 +97,28 @@ after each step):
    +12% standard, +5% wide/deep/shortstack. The maps are tiny: the
    showdown table is per interned river board (~66 KB), foldSon is
    per fold node (~12 MB on the 52k-node tree).
+6. **Forward kernel fusion** (GPU_CFR_PROFILE attribution showed the
+   graph replay cost flooring small trees): decide and chance nodes at
+   one depth run in a single flat launch — they are independent (both
+   read depth-d reach, write disjoint children at d+1) — with the
+   chance (node, branch) blocks located by binary search over a
+   per-depth branch prefix table. Halves the forward graph nodes
+   (shortstack tree: 61 -> 27 total). +6.6% shortstack, +1-1.5% on the
+   wide trees. Also: fold accumulates the reach total in the same pass
+   as its per-card scatter (barrier kept after the atomics — dropping
+   it exposed a run-to-run nondeterminism on one gate spot, so it
+   stays), and the graph now prints its node count.
+7. **Tried and reverted: warp-per-node backward** (motivated by the
+   per-kind profile: showdown ~45-50% of the backward, decide ~20%,
+   fold ~15%): one node per warp, per-warp shared slices, no block
+   barriers. 1.5-2x SLOWER across the board — small trees lose block
+   parallelism (count/4 blocks on a 46-SM GPU) and the wide tree's
+   per-lane serial chains got 2.5x longer. The block-level version
+   hides gather/scatter latency with 4x more threads per node;
+   same lesson as the block-batching experiment (item 4).
 
-Cumulative turn throughput: ~3.7x (wide 193 -> ~735, standard 1401 ->
-~4,650 iters/s).
+Cumulative turn throughput: ~3.9x (wide 193 -> ~747, standard 1401 ->
+~4,650, shortstack 96 -> ~89 us/iter).
 
 ### Bugs found by validation so far (all fixed)
 
@@ -119,10 +138,12 @@ Cumulative turn throughput: ~3.7x (wide 193 -> ~735, standard 1401 ->
 
 ## 2. What is missing (turn focus, highest impact first)
 
-1. **Launch-bound small trees** — the ~61-graph-node replay costs
-   ~100 us on WSL regardless of tree size (the shortstack spot is pure
-   floor). Fusing the same-depth forward decide+chance kernels and the
-   per-depth backward dispatch would cut graph nodes ~30%.
+1. **Launch-bound small trees** — the forward fusion cut the graph to
+   27 nodes on the shortstack tree; the remaining floor is the
+   per-depth backward launches (one per depth per traverser). The
+   per-kind profile attribution (GPU_CFR_PROFILE=1) shows the wide
+   tree is backward-compute-bound (showdown ~45-50% of the backward),
+   so further small-tree gains now trade against big-tree throughput.
 2. **Flop spots** — engine support exists (3-card boards), but gates
    (`make gpu-quick`/`gpu-parity`) and `turn-bench` cover turn only, by
    decision, until the turn perf work lands. The oracle flop solves are
