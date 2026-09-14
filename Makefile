@@ -13,7 +13,7 @@ SRCS := src/cards.cpp src/common.cpp src/eval.cpp src/fgs.cpp src/hand169.cpp \
 HEADERS := $(wildcard src/*.h)
 BUILD := build
 
-.PHONY: all test verify-pfs stub-bias gpu-quick gpu-parity turn-bench flop-bench clean
+.PHONY: all test verify-pfs stub-bias gpu-quick gpu-parity turn-bench flop-bench perf-loop clean
 
 all: $(BUILD)/ppsolve
 
@@ -64,6 +64,12 @@ gpu-parity:
 # Performance trackers (phase breakdown + iters/s).
 turn-bench:
 	tools/quality/bench_turn.sh
+
+# One-command perf feedback loop: rebuild, gpu-quick gate, turn-bench,
+# and a per-spot iters/s comparison against the previous run (history in
+# build-cuda/.bench_last). Exits nonzero on any failure or regression.
+perf-loop:
+	tools/quality/perf_loop.sh
 
 # Flop benchmark: bets 0.4 pot + all-in, raises 2.5x (see bench_flop.sh).
 flop-bench:
