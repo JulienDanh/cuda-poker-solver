@@ -81,11 +81,15 @@ class SolveParams(BaseModel):
     target: Optional[float] = Field(None, gt=0.0,
                                     description="exploitability target "
                                     "(chips); stops early once reached")
+    wait: bool = Field(True, description="false: run as a background job "
+                      "in iteration chunks (progress via GET "
+                      "/solvers/{id}); the response returns immediately")
 
 
 class ContinueParams(BaseModel):
     max_iters: int = Field(2000, gt=0, le=MAX_ITERS)
     target: Optional[float] = Field(None, gt=0.0)
+    wait: bool = Field(True, description="see solve(wait)")
 
 
 class SaveParams(BaseModel):
@@ -97,7 +101,8 @@ class LoadParams(BaseModel):
 
 
 class _Entry:
-    __slots__ = ("solver", "lock", "created", "last_used", "board", "paths")
+    __slots__ = ("solver", "lock", "created", "last_used", "board", "paths",
+                 "tree", "decide_idx", "job")
 
     def __init__(self, solver: Solver, board: str):
         self.solver = solver
@@ -105,7 +110,10 @@ class _Entry:
         self.created = time.time()
         self.last_used = self.created
         self.board = board
-        self.paths = None  # cached action-path labels (never change)
+        self.paths = None   # cached action-path labels (never change)
+        self.tree = None    # cached tree structure (kinds + CSR children)
+        self.decide_idx = None  # node_id -> decide index
+        self.job = None     # async solve job dict while running
 
 
 class Registry:
@@ -204,6 +212,8 @@ def _node_paths(e: "_Entry") -> List[str]:
     Child node ids are always greater than their parent's (the tree
     builder allocates parents first), so one forward pass works.
     Decide edges carry their action label; chance edges are the deal.
+    Also caches the tree structure and the node_id -> decide index map
+    for node-nav.
     """
     if e.paths is not None:
         return e.paths
@@ -231,7 +241,28 @@ def _node_paths(e: "_Entry") -> List[str]:
                 paths[c] = f"{p} — deal"
         # fold/showdown are leaves
     e.paths = paths
+    e.tree = tree
+    e.decide_idx = {d["node_id"]: d["index"] for d in dns}
     return paths
+
+
+def _first_decide(e: "_Entry", start: int) -> Optional[int]:
+    """Node id of the first decide node in `start`'s subtree (BFS from
+    its children), or None for a runout that ends in showdown.
+    Chance branches are followed; fold/showdown are terminal."""
+    kinds, cb, ch = e.tree["kinds"], e.tree["child_base"], e.tree["children"]
+    n = len(kinds)
+    q = [start]
+    while q:
+        u = q.pop(0)
+        nxt = cb[u + 1] if u + 1 < n else len(ch)
+        for i in range(cb[u], nxt):
+            c = ch[i]
+            if kinds[c] == 0:
+                return c
+            if kinds[c] == 3:
+                q.append(c)
+    return None
 
 
 def _solver_meta(sid: str, e: _Entry) -> Dict[str, Any]:
@@ -244,6 +275,7 @@ def _solver_meta(sid: str, e: _Entry) -> Dict[str, Any]:
         "max_depth": s.max_depth,
         "total_iterations": s.total_iterations,
         "iterations_run": s.iterations_run,
+        "job": dict(e.job) if e.job else None,
     }
 
 
@@ -291,9 +323,66 @@ def delete_solver(sid: str) -> Dict[str, bool]:
     return {"removed": True}
 
 
+def _job_worker(e: "_Entry", kind: str, p: SolveParams) -> None:
+    """Background solve: iteration chunks with progress reporting.
+
+    Chunked continuation follows the exact same DCFR schedule as one
+    long solve (the staircase depends only on the cumulative t —
+    gated by python/test_pps.py's warm-start test), so this is purely
+    a progress/UX split. Each chunk takes the global GPU lock and the
+    solver lock, so queries interleave between chunks.
+    """
+    s = e.solver
+    target = p.target if p.target is not None else -1.0
+    chunk = max(128, p.max_iters // 50)
+    remaining = p.max_iters
+    e.job["start"] = s.total_iterations
+    try:
+        if kind == "solve":
+            take = min(chunk, remaining)
+            with SOLVE_LOCK, e.lock:
+                s.solve(take, p.algo, target)
+            e.job["done"] = s.total_iterations - e.job["start"]
+            remaining -= s.iterations_run
+            if s.iterations_run < take:  # target hit
+                remaining = 0
+        while remaining > 0 and not e.job["cancel"]:
+            take = min(chunk, remaining)
+            with SOLVE_LOCK, e.lock:
+                s.continue_solve(take, target)
+            e.job["done"] = s.total_iterations - e.job["start"]
+            ran = s.iterations_run
+            remaining -= ran
+            if ran < take:  # early stop on the target
+                remaining = 0
+        e.job["status"] = "cancelled" if e.job["cancel"] else "done"
+    except Exception as ex:  # engine errors end the job, not the server
+        e.job["status"] = "error"
+        e.job["error"] = str(ex)
+    finally:
+        e.job["running"] = False
+
+
+def _start_job(sid: str, e: "_Entry", kind: str,
+               p: SolveParams) -> Dict[str, Any]:
+    if e.job and e.job["running"]:
+        raise HTTPException(409, "a solve job is already running on this "
+                                 "solver (POST /solvers/{id}/cancel first)")
+    e.job = {"running": True, "status": "running", "kind": kind,
+             "done": 0, "start": 0,
+             "total": p.max_iters, "target": p.target, "error": None,
+             "cancel": False}
+    t = threading.Thread(target=_job_worker, args=(e, kind, p),
+                         daemon=True)
+    t.start()
+    return {"id": sid, "job": dict(e.job)}
+
+
 @app.post("/solvers/{sid}/solve")
-def solve(sid: str, p: SolveParams) -> Dict[str, Any]:
+def solve(sid: str, p: SolveParams):
     e = REGISTRY.get(sid)
+    if not p.wait:
+        return _start_job(sid, e, "solve", p)
     with e.lock:
         t0 = time.perf_counter()
         _solve(e.solver, p)
@@ -306,8 +395,10 @@ def solve(sid: str, p: SolveParams) -> Dict[str, Any]:
 
 
 @app.post("/solvers/{sid}/continue")
-def continue_solve(sid: str, p: ContinueParams) -> Dict[str, Any]:
+def continue_solve(sid: str, p: ContinueParams):
     e = REGISTRY.get(sid)
+    if not p.wait:
+        return _start_job(sid, e, "continue", p)
     with e.lock:
         t0 = time.perf_counter()
         target = p.target if p.target is not None else -1.0
@@ -319,6 +410,15 @@ def continue_solve(sid: str, p: ContinueParams) -> Dict[str, Any]:
                       "iterations_run": e.solver.iterations_run,
                       "total_iterations": e.solver.total_iterations,
                       "stats": st})
+
+
+@app.post("/solvers/{sid}/cancel")
+def cancel_job(sid: str) -> Dict[str, Any]:
+    e = REGISTRY.get(sid)
+    if not (e.job and e.job["running"]):
+        return {"cancelled": False}
+    e.job["cancel"] = True
+    return {"cancelled": True}
 
 
 @app.post("/solvers/{sid}/reset")
@@ -357,6 +457,58 @@ def solver_decide_nodes(sid: str, offset: int = Query(0, ge=0),
         d["path"] = paths[d["node_id"]] or "(root)"
     return {"total": total,
             "nodes": nodes[offset:offset + limit]}
+
+
+@app.get("/solvers/{sid}/node-nav")
+def solver_node_nav(sid: str, node: int = Query(0, ge=0)) -> Dict[str, Any]:
+    """Navigation out of decide node `node`: one entry per action with
+    the child's kind and the first DECIDE node reachable through that
+    edge (chance branches are followed to the next street; fold and
+    showdown are terminal; an all-in runout may reach no decide node).
+    Drives the UI's action-history bar."""
+    e = REGISTRY.get(sid)
+    _node_paths(e)  # builds/caches tree + decide index too
+    with e.lock:
+        dns = _engine(e.solver.decide_nodes)
+    if node >= len(dns):
+        raise HTTPException(400, f"decide node {node} out of range")
+    d = dns[node]
+    kinds, cb, ch = e.tree["kinds"], e.tree["child_base"], e.tree["children"]
+    kind_name = {0: "decide", 1: "showdown", 2: "fold", 3: "chance"}
+    actions = []
+    for a, child in zip(d["actions"], d["children"]):
+        item = {"label": _action_text(a), "kind": a["kind"],
+                "amount": a.get("amount", 0),
+                "child_node": child, "child_kind": kind_name[kinds[child]]}
+        nxt = child if kinds[child] == 0 else _first_decide(e, child)
+        item["next_decide"] = \
+            e.decide_idx[nxt] if nxt is not None else None
+        actions.append(item)
+    return {"node": node, "path": e.paths[d["node_id"]] or "(root)",
+            "player": d["player"], "n_board": d["n_board"],
+            "actions": actions}
+
+
+_RSRC = "23456789TJQKA"
+_SUITS = "cdhs"
+
+
+def _card_text(cid: int) -> str:
+    return _RSRC[cid % 13] + _SUITS[cid // 13]
+
+
+@app.get("/solvers/{sid}/range")
+def solver_range(sid: str, player: int = Query(0, ge=0, le=1)) -> Dict[str, Any]:
+    """The compiled range of `player`: combo card pairs (text) with
+    weights, aligned (board-filtered, positive-weight only)."""
+    e = REGISTRY.get(sid)
+    with e.lock:
+        cards = _engine(e.solver.player_cards, player)
+        w = _engine(e.solver.player_weights, player)
+    return {"player": player,
+            "combos": [_card_text(cards[2 * i]) + _card_text(cards[2 * i + 1])
+                       for i in range(len(w))],
+            "weights": _jsonable(np.asarray(w))}
 
 
 @app.get("/solvers/{sid}/root-ev")

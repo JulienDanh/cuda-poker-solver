@@ -4,6 +4,7 @@
 import os
 import sys
 import tempfile
+import time
 
 from fastapi.testclient import TestClient
 
@@ -185,12 +186,92 @@ def test_ui_and_paths():
     check(client.delete(f"/solvers/{sid}"))
 
 
+def test_node_nav_and_range():
+    r = check(client.post("/solvers", json=SPOT), 201)
+    sid = r["id"]
+    check(client.post(f"/solvers/{sid}/solve", json={"max_iters": 200}))
+
+    nav = check(client.get(f"/solvers/{sid}/node-nav?node=0"))
+    assert nav["path"] == "(root)"
+    acts = {a["label"]: a for a in nav["actions"]}
+    assert set(acts) == {"check", "bet 150", "all-in"}
+    # OOP checks -> IP's first decision is decide node 1
+    assert acts["check"]["next_decide"] == 1
+    # bet leads to IP facing the bet; the all-in leads to IP's
+    # fold-or-call decision (the runout only starts after the call)
+    assert acts["bet 150"]["next_decide"] is not None
+    assert acts["all-in"]["next_decide"] is not None
+    # deeper: at IP's check-back decision (node 1) there is no fold;
+    # IP's check closes the street and chance deals — the first river
+    # decide node is reachable through that edge
+    nav1 = check(client.get(f"/solvers/{sid}/node-nav?node=1"))
+    a1 = {a["kind"]: a for a in nav1["actions"]}
+    assert "fold" not in a1
+    assert a1["check"]["next_decide"] is not None
+
+    rng = check(client.get(f"/solvers/{sid}/range?player=0"))
+    assert len(rng["combos"]) == len(rng["weights"]) > 0
+    assert all(len(c) == 4 for c in rng["combos"])
+    assert sum(rng["weights"]) > 0
+    check(client.get(f"/solvers/{sid}/node-nav?node=99999"), 400)
+    check(client.delete(f"/solvers/{sid}"))
+
+
+def test_async_job():
+    r = check(client.post("/solvers", json=SPOT), 201)
+    sid = r["id"]
+    # background solve: response returns immediately with the job
+    r = check(client.post(f"/solvers/{sid}/solve",
+                          json={"max_iters": 600, "wait": False}), 200)
+    assert r["job"]["running"] is True
+    # a second concurrent job is rejected while it runs (or after, the
+    # status flips; assert only the conflict semantics when running)
+    meta = poll_job(sid)
+    assert meta["job"]["status"] == "done"
+    assert meta["total_iterations"] == 600
+    st = check(client.get(f"/solvers/{sid}/stats"))
+    assert abs(st["ev_oop"] + st["ev_ip"] - SPOT["pot"]) < 0.05
+    # chunked job == one long solve (warm-start invariant, loose bound
+    # for the replay nondeterminism)
+    r2 = check(client.post("/solve",
+                           json={**SPOT, "max_iters": 600}))
+    assert abs(r2["stats"]["ev_oop"] - st["ev_oop"]) < 0.02
+
+    # continue as a job
+    r = check(client.post(f"/solvers/{sid}/continue",
+                          json={"max_iters": 200, "wait": False}), 200)
+    meta = poll_job(sid)
+    assert meta["job"]["status"] == "done"
+    assert meta["total_iterations"] == 800
+
+    # cancel a longer job
+    r = check(client.post(f"/solvers/{sid}/continue",
+                          json={"max_iters": 50000, "wait": False}), 200)
+    time.sleep(0.6)  # let at least one chunk land
+    check(client.post(f"/solvers/{sid}/cancel"), 200)
+    meta = poll_job(sid)
+    assert meta["job"]["status"] == "cancelled"
+    assert 800 < meta["total_iterations"] < 50000
+    check(client.delete(f"/solvers/{sid}"))
+
+
+def poll_job(sid, timeout=60.0):
+    import time as _t
+    t0 = _t.time()
+    while _t.time() - t0 < timeout:
+        meta = check(client.get(f"/solvers/{sid}"))
+        if meta["job"] and not meta["job"]["running"]:
+            return meta
+        _t.sleep(0.1)
+    raise AssertionError("job did not finish in time")
+
+
 def main():
     for t in (test_health, test_lifecycle, test_one_shot, test_errors,
-              test_ui_and_paths):
+              test_ui_and_paths, test_node_nav_and_range, test_async_job):
         t()
         print(f"  {t.__name__}: ok", file=sys.stderr)
-    print("pps api tests: 5 passed", file=sys.stderr)
+    print("pps api tests: 7 passed", file=sys.stderr)
 
 
 if __name__ == "__main__":

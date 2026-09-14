@@ -142,11 +142,20 @@ serialize on a global lock (one GPU), queries lock their solver only.
 Solution files live under `PPS_API_DATA_DIR` (default
 `build-cuda/api-solutions`); names are sandboxed to that directory.
 
+Solves can run as background jobs: pass `"wait": false` to
+`/solvers/{id}/solve` or `/continue` and poll `GET /solvers/{id}`
+(`job.status/done/total`); `/cancel` stops at the next chunk. The job
+runs in iteration chunks whose continuation is exactly the same DCFR
+schedule as one long solve (gated by the warm-start test), so this is
+purely a progress split.
+
 The UI (`/ui/`) mirrors the desktop-postflop workflow (the reference
 open-source GTO UI, which this repo cannot reuse code from — it is
-AGPL-3.0 and this repo is MIT): a 52-card board picker, range inputs,
-solve-to-target with progress, a decision-tree browser with labeled
-action paths, per-combo strategy grids with color-weighted
-frequencies, per-combo EV tables, and save/load/warm-start controls.
-No external code is included — it is plain HTML/CSS/JS served as
-static files.
+AGPL-3.0 and this repo is MIT) and iterates toward the GTO-Wizard
+study flow: a 52-card board picker, range inputs, background solves
+with a progress bar, a breadcrumb action history with clickable
+next-action buttons (per-action next decide node via `node-nav`),
+13x13 hand matrices with stacked action-frequency colors, range
+matrices, per-combo strategy tables, per-combo EV tables, and
+save/load/warm-start controls. No external code is included — it is
+plain HTML/CSS/JS served as static files.

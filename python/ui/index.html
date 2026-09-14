@@ -43,17 +43,22 @@
       <h2>Solve</h2>
       <div class="row">
         <div><label>max iterations</label><input id="iters" type="number" value="2000" min="1"></div>
-        <div><label>target expl (chips, optional)</label><input id="target" type="number" step="0.01" min="0" placeholder="e.g. 0.1"></div>
+        <div><label>target expl (optional)</label><input id="target" type="number" step="0.01" min="0" placeholder="e.g. 0.1"></div>
       </div>
       <button id="solve" class="primary">Solve spot</button>
+      <div id="progress" class="hidden">
+        <div class="bar"><div id="bar-fill"></div></div>
+        <div id="progress-text" class="dim"></div>
+        <button class="mini danger" id="cancel-job">cancel</button>
+      </div>
     </div>
 
     <div class="panel">
       <h2>Solvers</h2>
       <div id="solver-list" class="slist"></div>
       <div class="row buttons">
-        <button class="mini" id="continue-btn">+ iterations</button>
-        <button class="mini" id="to-target-btn">to target</button>
+        <button class="mini" id="continue-btn" title="warm-start more iterations">+ iterations</button>
+        <button class="mini" id="to-target-btn" title="continue until the target exploitability">to target</button>
         <button class="mini" id="reset-btn">reset</button>
         <button class="mini" id="save-btn">save</button>
         <button class="mini" id="load-btn">load</button>
@@ -71,14 +76,32 @@
       <div id="stats" class="stats">no solution loaded</div>
     </div>
 
+    <div class="panel" id="spot-panel">
+      <h2>Spot</h2>
+      <div id="big-board" class="bigboard"></div>
+      <div id="history" class="history"></div>
+      <div id="nav-actions" class="navactions"></div>
+    </div>
+
     <nav id="tabs">
-      <button data-tab="strategy" class="tab active">Strategy</button>
+      <button data-tab="matrix" class="tab active">Matrix</button>
+      <button data-tab="combos" class="tab">Combos</button>
       <button data-tab="tree" class="tab">Tree</button>
+      <button data-tab="ranges" class="tab">Ranges</button>
       <button data-tab="ev" class="tab">Root EV</button>
     </nav>
 
-    <div class="panel tab-body" id="tab-strategy">
-      <h2 id="strat-title">Strategy — node 0</h2>
+    <div class="panel tab-body" id="tab-matrix">
+      <div class="mhead">
+        <h2 id="strat-title">Strategy — node 0</h2>
+        <div id="legend"></div>
+      </div>
+      <div id="matrix" class="matrix"></div>
+      <div id="cell-detail" class="dim"></div>
+    </div>
+
+    <div class="panel tab-body hidden" id="tab-combos">
+      <h2>Per-combo strategy</h2>
       <div id="aggregate"></div>
       <div class="tbl-wrap"><table id="strat-table"></table></div>
     </div>
@@ -94,10 +117,20 @@
       </div>
     </div>
 
+    <div class="panel tab-body hidden" id="tab-ranges">
+      <h2>Ranges</h2>
+      <div class="row">
+        <button class="mini" data-rp="oop">OOP</button>
+        <button class="mini" data-rp="ip">IP</button>
+      </div>
+      <div id="range-matrix" class="matrix"></div>
+      <div id="range-detail" class="dim"></div>
+    </div>
+
     <div class="panel tab-body hidden" id="tab-ev">
       <h2>Per-combo root EV (vs average strategy)</h2>
       <div class="row">
-        <button class="mini" data-evp="oop" class="active">OOP</button>
+        <button class="mini" data-evp="oop">OOP</button>
         <button class="mini" data-evp="ip">IP</button>
       </div>
       <div class="tbl-wrap"><table id="ev-table"></table></div>
@@ -106,7 +139,7 @@
   </section>
 </main>
 
-<div id="overlay" class="hidden"><div id="overlay-text">solving… <span id="elapsed"></span></div></div>
+<div id="overlay" class="hidden"><div id="overlay-text">working… <span id="elapsed"></span></div></div>
 
 <script src="app.js"></script>
 </body>

@@ -234,6 +234,20 @@ after each step):
     tables, save/load/warm-start. 5-test HTTP suite + live-server
     smoke (health, /ui/, one-shot solve) + quick gate green.
 
+15. **UI iteration toward the GTO-Wizard study flow**: solves now run as
+    background jobs (iteration chunks in a worker thread with progress +
+    cancel endpoints — chunked continuation is exact, gated by the
+    warm-start test), and the API gained `node-nav` (per-action: the
+    first decide node reachable through each edge, via BFS over the
+    cached tree structure) and `range` (compiled per-player weights).
+    The UI: 13x13 hand matrix with stacked action-frequency colors
+    (per-class unweighted mean of its combos), breadcrumb action
+    history with clickable next-action buttons (GTO-style kind colors,
+    dimmed undealt board cards), range matrices, per-combo tables,
+    root-EV tables, and a progress bar during solves. 7-case HTTP
+    suite (async jobs incl. cancel + node-nav semantics + ranges)
+    + live-server smoke green.
+
 Cumulative turn throughput: ~4.0x (wide 193 -> ~785, standard 1401 ->
 ~4,730, shortstack 96 -> ~87 us/iter); practical flop 56 -> ~58
 iters/s (1500 stack) and 201 -> ~211 (500 stack).

@@ -1,25 +1,34 @@
 // pps solver UI: vanilla JS over the pps_api HTTP surface.
-// Workflow mirrors desktop-postflop's: build a spot (board picker +
-// ranges), solve, browse the labeled decision tree, read per-combo
-// strategy grids and EVs, save/load and warm-start solutions.
+// GTO-Wizard-style study flow: build a spot, solve in the background
+// with progress, walk the tree by clicking actions, read 13x13 hand
+// matrices (stacked action frequencies), per-combo tables and root EVs.
 "use strict";
 
 const $ = (id) => document.getElementById(id);
-const RANKS = "23456789TJQKA";
 const SUITS = "cdhs";
+const SUIT_GLYPH = { c: "\u2663", d: "\u2666", h: "\u2665", s: "\u2660" };
 const SUIT_RED = { d: true, h: true };
+const RANKS_HIGH = "AKQJT98765432";  // matrix order (A first)
+const RANK_VAL = { "2": 0, "3": 1, "4": 2, "5": 3, "6": 4, "7": 5, "8": 6,
+  "9": 7, T: 8, J: 9, Q: 10, K: 11, A: 12 };
+
+// GTO-ish action colors; repeated kinds in one node shift hue.
+const KIND_HUE = { check: 172, call: 152, bet: 212, raise: 28, allin: 356,
+  fold: 215 };
+const kindColor = (kind, i) =>
+  `hsl(${(KIND_HUE[kind] || 0) + i * 26}, 62%, ${45 + (i % 2) * 6}%)`;
 
 // ---------------- board picker ----------------
-let board = ["Qs", "9h", "2d"];  // turn spot default
+let board = ["Qs", "9h", "2d"];
 
-function cardTextCls(c) { return SUIT_RED[c[1]] ? "red" : "blk"; }
+const clsOf = (c) => (SUIT_RED[c[1]] ? "red" : "blk");
 
 function renderBoard() {
   const el = $("board-slots");
   el.innerHTML = "";
   for (let i = 0; i < 5; i++) {
     const s = document.createElement("div");
-    s.className = "slot " + (board[i] ? cardTextCls(board[i]) : "");
+    s.className = "slot " + (board[i] ? clsOf(board[i]) : "");
     s.textContent = board[i] || "";
     s.onclick = () => { if (board[i]) { board.splice(i, 1); render(); } };
     el.appendChild(s);
@@ -31,10 +40,10 @@ function renderPicker() {
   const el = $("card-picker");
   el.innerHTML = "";
   for (const su of SUITS) {
-    for (const r of RANKS) {
+    for (const r of RANKS_HIGH) {
       const c = r + su;
       const b = document.createElement("div");
-      b.className = "pk " + cardTextCls(c) + (board.includes(c) ? " used" : "");
+      b.className = "pk " + clsOf(c) + (board.includes(c) ? " used" : "");
       b.textContent = c;
       b.onclick = () => {
         if (board.includes(c) || board.length >= 5) return;
@@ -49,15 +58,15 @@ function renderPicker() {
 function render() { renderBoard(); renderPicker(); }
 
 // ---------------- fetch helpers ----------------
-let busyTimer = null;
-async function api(method, url, body) {
-  const overlay = method === "POST" || url.includes("solve");
-  if (overlay) {
+let overlayTimer = null;
+async function api(method, url, body, showOverlay) {
+  if (showOverlay) {
     $("overlay").classList.remove("hidden");
     const t0 = performance.now();
-    clearInterval(busyTimer);
-    busyTimer = setInterval(() => {
-      $("elapsed").textContent = ((performance.now() - t0) / 1000).toFixed(1) + "s";
+    clearInterval(overlayTimer);
+    overlayTimer = setInterval(() => {
+      $("elapsed").textContent =
+        ((performance.now() - t0) / 1000).toFixed(1) + "s";
     }, 100);
   }
   try {
@@ -69,19 +78,21 @@ async function api(method, url, body) {
     if (!r.ok) throw new Error(data.detail || r.statusText);
     return data;
   } finally {
-    clearInterval(busyTimer);
-    if (overlay) $("overlay").classList.add("hidden");
+    clearInterval(overlayTimer);
+    if (showOverlay) $("overlay").classList.add("hidden");
   }
 }
 
-function err(where) {
-  return (e) => {
-    const el = $(where);
-    el.innerHTML = `<span class="error">${e.message}</span>`;
-  };
-}
+const err = (where) => (e) => {
+  $(where).innerHTML = `<span class="error">${e.message}</span>`;
+};
 
-// ---------------- spot & solve ----------------
+// ---------------- state ----------------
+let active = null;         // current solver id
+let history = [{ node: 0, label: "(root)", who: 0 }];
+let jobTimer = null;
+let currentStrategy = null;
+
 function spotBody() {
   return {
     board: board.join(""),
@@ -94,27 +105,53 @@ function spotBody() {
   };
 }
 
-function solveParams() {
-  return {
-    max_iters: parseInt($("iters").value, 10),
-    target: $("target").value ? parseFloat($("target").value) : null,
-  };
+// ---------------- stats ----------------
+function showStats(st, extra) {
+  const el = $("stats");
+  const fmt = (x, p) => (typeof x === "number" ? x.toFixed(p) : "—");
+  el.innerHTML = `
+    <div class="stat"><div class="v oop">${fmt(st.ev_oop, 2)}</div><div class="k">EV OOP</div></div>
+    <div class="stat"><div class="v ip">${fmt(st.ev_ip, 2)}</div><div class="k">EV IP</div></div>
+    <div class="stat"><div class="v">${fmt(st.exploitability, 4)}</div><div class="k">exploitability</div></div>
+    ${extra || ""}`;
 }
 
-let active = null;  // current solver id
+// ---------------- solve (background job) ----------------
+async function startJob(path, body) {
+  try {
+    const r = await api("POST", `/solvers/${active}/${path}`,
+      { ...body, wait: false }, path === "solve" && body.fresh);
+    $("progress").classList.remove("hidden");
+    clearInterval(jobTimer);
+    jobTimer = setInterval(pollJob, 500);
+    return r;
+  } catch (e) { err("stats")(e); }
+}
 
-function showStats(r) {
-  const st = r.stats || r;
-  const el = $("stats");
-  el.innerHTML = `
-    <div class="stat"><div class="v oop">${st.ev_oop?.toFixed(2)}</div><div class="k">EV OOP</div></div>
-    <div class="stat"><div class="v ip">${st.ev_ip?.toFixed(2)}</div><div class="k">EV IP</div></div>
-    <div class="stat"><div class="v">${st.exploitability?.toFixed(4)}</div><div class="k">exploitability</div></div>
-    ${r.iterations_run != null ? `
-      <div class="stat"><div class="v">${r.iterations_run}</div><div class="k">iters (last)</div></div>
-      <div class="stat"><div class="v">${r.total_iterations ?? r.iterations_run}</div><div class="k">iters (total)</div></div>
-      <div class="stat"><div class="v">${r.compile_ms != null ? r.compile_ms + "ms" : ""}</div><div class="k">compile</div></div>
-      <div class="stat"><div class="v">${(r.solve_ms ?? r.continue_ms ?? "")}</div><div class="k">solve ms</div></div>` : ""}`;
+async function pollJob() {
+  if (!active) return;
+  let meta;
+  try {
+    meta = await api("GET", `/solvers/${active}`);
+  } catch (e) { return; }
+  const job = meta.job;
+  if (!job) { clearInterval(jobTimer); $("progress").classList.add("hidden"); return; }
+  const pct = job.total ? Math.min(100, 100 * job.done / job.total) : 0;
+  $("bar-fill").style.width = pct.toFixed(1) + "%";
+  $("progress-text").textContent =
+    `${job.status} — ${job.done}/${job.total} iters` +
+    `${job.error ? " — " + job.error : ""}`;
+  if (!job.running) {
+    clearInterval(jobTimer);
+    $("progress").classList.add("hidden");
+    if (job.status === "error") err("stats")(new Error(job.error));
+    else {
+      const st = await api("GET", `/solvers/${active}/stats`);
+      showStats(st, `<div class="stat"><div class="v">${meta.total_iterations}</div><div class="k">iters total</div></div>`);
+      await selectNode(history[history.length - 1].node);
+    }
+    refreshSolvers();
+  }
 }
 
 async function solve() {
@@ -122,14 +159,15 @@ async function solve() {
     err("stats")(new Error("board must be 3-5 cards")); return;
   }
   try {
-    const r = await api("POST", "/solve",
-      { ...spotBody(), ...solveParams(), keep: true });
-    active = r.solver_id;
-    showStats(r);
+    // compile + register, then solve as a background job
+    const created = await api("POST", "/solvers", spotBody(), true);
+    active = created.id;
+    history = [{ node: 0, label: "(root)", who: 0 }];
     await refreshSolvers();
-    await selectNode(0);
-    treePage = 0;
-    await renderTree();
+    await startJob("solve", {
+      max_iters: parseInt($("iters").value, 10),
+      target: $("target").value ? parseFloat($("target").value) : null,
+    });
   } catch (e) { err("stats")(e); }
 }
 
@@ -137,58 +175,230 @@ async function solve() {
 async function refreshSolvers() {
   const list = await api("GET", "/solvers");
   const el = $("solver-list");
-  if (!list.length) { el.innerHTML = '<span class="id">none</span>'; return; }
+  if (!list.length) { el.innerHTML = '<span class="dim">none</span>'; return; }
   el.innerHTML = "";
   for (const s of list) {
     const d = document.createElement("div");
     d.className = "sent" + (s.id === active ? " sel" : "");
-    d.innerHTML =
-      `<span class="id">${s.id}</span> ${s.board} <span class="id">` +
-      `${s.total_iterations} iters</span>`;
+    const busy = s.job && s.job.running ? " ●" : "";
+    d.innerHTML = `<span class="id">${s.id}${busy}</span> ${s.board} ` +
+      `<span class="id">${s.total_iterations} iters</span>`;
     d.onclick = async () => {
       active = s.id;
+      history = [{ node: 0, label: "(root)", who: 0 }];
       await refreshSolvers();
       const st = await api("GET", `/solvers/${active}/stats`);
-      showStats(st);
+      showStats(st, `<div class="stat"><div class="v">${s.total_iterations}</div><div class="k">iters total</div></div>`);
       await selectNode(0);
     };
     el.appendChild(d);
   }
 }
 
-async function solverAction(path, body, label) {
+async function solverAction(path, body) {
   if (!active) return err("stats")(new Error("no active solver"));
-  try {
-    const r = await api("POST", `/solvers/${active}/${path}`, body);
-    if (r.stats) showStats(r);
-    await refreshSolvers();
-    await selectNode(currentNode);
-    return r;
-  } catch (e) { err("stats")(e); }
+  if (path === "reset") {
+    try {
+      await api("POST", `/solvers/${active}/reset`, {});
+      history = [{ node: 0, label: "(root)", who: 0 }];
+      await refreshSolvers();
+      await selectNode(0);
+    } catch (e) { err("stats")(e); }
+    return;
+  }
+  await startJob(path, body);
 }
 
-// ---------------- strategy view ----------------
-let currentNode = 0;
-
-function freqColor(f) {
-  // white -> accent blue by frequency
-  const a = Math.round(f * 100);
-  return `rgba(79,140,255,${(0.08 + 0.75 * f).toFixed(3)})`;
+// ---------------- hand classes / matrix ----------------
+function comboClass(c) {  // "AhKd" -> {r: hi, c: lo, cls: "AKo"}
+  const r1 = RANK_VAL[c[0]], r2 = RANK_VAL[c[2]];
+  const hi = Math.max(r1, r2), lo = Math.min(r1, r2);
+  const suited = c[1] === c[3];
+  const cls = hi === lo ? RANKS_HIGH[12 - hi] + RANKS_HIGH[12 - hi]
+    : RANKS_HIGH[12 - hi] + RANKS_HIGH[12 - lo] + (suited ? "s" : "o");
+  return { hi, lo, cls };
 }
 
-async function selectNode(idx) {
+function renderMatrix(classes) {
+  // classes: {"AKs": {freqs: [...], n: 2}, ...} or null cells
+  const m = $("matrix");
+  m.innerHTML = "";
+  m.appendChild(el("div", "mxh", ""));
+  for (const r of RANKS_HIGH) m.appendChild(el("div", "mxh", r));
+  for (const ri of RANKS_HIGH) {
+    const h = el("div", "mxh rowh", ri);
+    h.style.display = "flex"; h.style.alignItems = "center";
+    m.appendChild(h);
+    for (const ci of RANKS_HIGH) {
+      const r = 12 - RANK_VAL[ri], c = 12 - RANK_VAL[ci];
+      const suited = ri !== ci && (RANK_VAL[ri] > RANK_VAL[ci]);
+      const cls = ri === ci ? ri + ci
+        : (suited ? ri + ci + "s" : ci + ri + "o");
+      const cell = el("div", "mxcell");
+      const d = classes ? classes[cls] : null;
+      if (d && d.n > 0) {
+        // stacked action frequencies as the cell background
+        const stops = [];
+        let acc = 0;
+        d.freqs.forEach((f, i) => {
+          if (f <= 0.001) return;
+          stops.push(`${d.colors[i]} ${acc * 100}% ${(acc + f) * 100}%`);
+          acc += f;
+        });
+        cell.style.background = stops.length
+          ? `linear-gradient(90deg, ${stops.join(",")})` : "#0d1016";
+        const dom = d.freqs.indexOf(Math.max(...d.freqs));
+        cell.textContent = (Math.max(...d.freqs) * 100).toFixed(0);
+        cell.title = d.freqs.map((f, i) =>
+          `${d.labels[i]} ${(f * 100).toFixed(1)}%`).join(" | ");
+        cell.onclick = () => {
+          document.querySelectorAll(".mxcell").forEach((x) =>
+            x.classList.remove("sel"));
+          cell.classList.add("sel");
+          $("cell-detail").innerHTML =
+            `<b>${cls}</b> (${d.n} combos): ` + d.freqs.map((f, i) =>
+              `${d.labels[i]} <b>${(f * 100).toFixed(1)}%</b>`).join(" · ");
+        };
+      } else {
+        cell.innerHTML = '<span class="dead">–</span>';
+        cell.title = cls + ": not in range";
+      }
+      m.appendChild(cell);
+    }
+  }
+}
+
+const el = (tag, cls, text) => {
+  const d = document.createElement(tag);
+  if (cls) d.className = cls;
+  if (text != null) d.textContent = text;
+  return d;
+};
+
+// ---------------- strategy / navigation ----------------
+async function selectNode(idx, step) {
   if (!active) return;
+  if (step) history.push(step);
   currentNode = idx;
   const s = await api("GET", `/solvers/${active}/strategy?node=${idx}`);
-  $("strat-title").textContent = `Strategy — node ${idx}`;
-  const agg = s.aggregate
-    ? "<b>aggregate:</b> " + s.actions.map((a, i) =>
-        `${a.kind}${a.amount ? " " + a.amount : ""} ` +
-        `${(s.aggregate[i] * 100).toFixed(1)}%`).join(" &nbsp; ")
-    : "(deeper node: per-combo frequencies only — the range-weighted " +
-      "aggregate is exact on first-street nodes)";
-  $("aggregate").innerHTML = agg;
+  const nav = await api("GET", `/solvers/${active}/node-nav?node=${idx}`);
+  currentStrategy = s;
+  renderSpot(nav);
+  renderMatrixFromStrategy(s);
+  renderCombosTable(s);
+  $("strat-title").textContent = `Strategy — ${nav.path || "(root)"}`;
+}
 
+let currentNode = 0;
+
+function renderSpot(nav) {
+  // big board cards; undealt cards are dimmed (n_board = cards live
+  // at this node — deeper nodes have seen the deal)
+  const bb = $("big-board");
+  bb.innerHTML = "";
+  board.forEach((c, i) => {
+    const dealt = i < (nav ? nav.n_board : board.length);
+    const d = el("div", "bcard" + (SUIT_RED[c[1]] ? " red" : ""),
+      c[0] + SUIT_GLYPH[c[1]]);
+    if (!dealt) d.style.opacity = ".25";
+    bb.appendChild(d);
+  });
+  for (let i = board.length; i < 5; i++) bb.appendChild(el("div", "bcard"));
+
+  // breadcrumb
+  const h = $("history");
+  h.innerHTML = "";
+  history.forEach((s, i) => {
+    if (i > 0) h.appendChild(el("span", "dim", "→"));
+    const c = el("div", "crumb" + (i === history.length - 1 ? " here" : ""));
+    const who = i === 0 ? "" :
+      `<span class="who p${s.who}">${s.who === 0 ? "OOP" : "IP"}</span> `;
+    c.innerHTML = who + s.label;
+    c.onclick = () => {
+      history = history.slice(0, i + 1);
+      selectNode(s.node);
+    };
+    h.appendChild(c);
+  });
+
+  // action buttons
+  const na = $("nav-actions");
+  na.innerHTML = "";
+  nav.actions.forEach((a, i) => {
+    const b = document.createElement("button");
+    const kindIdx = nav.actions.filter((x, j) => x.kind === a.kind && j <= i).length - 1;
+    b.className = "nact";
+    b.style.background = kindColor(a.kind, Math.max(0, kindIdx));
+    const sub = a.next_decide == null
+      ? ({ fold: "fold — terminal", showdown: "showdown" }[a.child_kind]
+         || (a.child_kind === "chance" ? "runout — terminal" : "terminal"))
+      : (a.child_kind === "chance" ? "deals next street" : "");
+    b.innerHTML = `${a.label}<small>${sub}</small>`;
+    b.disabled = a.next_decide == null;
+    b.onclick = () => {
+      if (a.next_decide == null) return;
+      // the chip records who acted: the current node's deciding player
+      const who = currentStrategy ? currentStrategy.player : 0;
+      selectNode(a.next_decide,
+        { node: a.next_decide, label: a.label, who });
+    };
+    na.appendChild(b);
+  });
+}
+
+function renderMatrixFromStrategy(s) {
+  const colors = s.actions.map((a, i) => kindColor(a.kind,
+    s.actions.filter((x, j) => x.kind === a.kind && j <= i).length - 1));
+  const labels = s.actions.map((a) =>
+    a.kind + (a.amount ? " " + a.amount : ""));
+  // per-class unweighted mean of its combos' frequencies
+  const classes = {};
+  for (let c = 0; c < s.cards.length; c++) {
+    const k = comboClass(s.cards[c]).cls;
+    if (!classes[k]) {
+      classes[k] = { n: 0,
+        freqs: new Array(s.actions.length).fill(0) };
+    }
+    classes[k].n++;
+    for (let a = 0; a < s.actions.length; a++)
+      classes[k].freqs[a] += s.freqs[a][c];
+  }
+  for (const cls in classes) {
+    const d = classes[cls];
+    for (let a = 0; a < d.freqs.length; a++) d.freqs[a] /= d.n;
+    d.colors = colors;
+    d.labels = labels;
+  }
+  renderMatrix(classes);
+
+  // legend with range-weighted aggregate where available
+  const lg = $("legend");
+  lg.innerHTML = "";
+  s.actions.forEach((a, i) => {
+    const l = el("div", "lg");
+    const sw = el("div", "sw");
+    sw.style.background = colors[i];
+    const t = a.kind + (a.amount ? " " + a.amount : "");
+    const agg = s.aggregate ? ` — ${(s.aggregate[i] * 100).toFixed(1)}%` : "";
+    l.appendChild(sw);
+    l.appendChild(el("span", "", t + agg));
+    lg.appendChild(l);
+  });
+  if (!s.aggregate) {
+    const note = el("div", "dim",
+      "deeper node: per-combo frequencies only (aggregate is exact on " +
+      "first-street nodes)");
+    note.style.marginTop = "6px";
+    $("aggregate").innerHTML = "";
+    $("aggregate").appendChild(note);
+  } else {
+    $("aggregate").innerHTML = "<b>aggregate:</b> " + s.actions.map((a, i) =>
+      `${a.kind}${a.amount ? " " + a.amount : ""} ` +
+      `<b>${(s.aggregate[i] * 100).toFixed(1)}%</b>`).join(" · ");
+  }
+}
+
+function renderCombosTable(s) {
   const t = $("strat-table");
   const heads = s.actions.map((a) =>
     `${a.kind}${a.amount ? " " + a.amount : ""}`).join("</th><th>");
@@ -197,8 +407,8 @@ async function selectNode(idx) {
     html += `<tr><td class="combo">${s.cards[c]}</td>`;
     for (let a = 0; a < s.actions.length; a++) {
       const f = s.freqs[a][c];
-      html += `<td class="freq" style="background:${freqColor(f)}">` +
-        `<b>${(f * 100).toFixed(1)}</b></td>`;
+      html += `<td class="freq" style="background:${kindColor(
+        s.actions[a].kind, a)}aa"><b>${(f * 100).toFixed(1)}</b></td>`;
     }
     html += "</tr>";
   }
@@ -208,17 +418,15 @@ async function selectNode(idx) {
 // ---------------- tree view ----------------
 const PAGE = 200;
 let treePage = 0;
-let treeNodes = [];
 
 async function renderTree() {
   if (!active) return;
   try {
     const r = await api("GET",
       `/solvers/${active}/decide-nodes?offset=${treePage * PAGE}&limit=${PAGE}`);
-    treeNodes = r.nodes;
-    const el = $("tree-list");
-    el.innerHTML = "";
     const flt = $("node-filter").value.toLowerCase();
+    const el2 = $("tree-list");
+    el2.innerHTML = "";
     for (const n of r.nodes) {
       if (flt && !n.path.toLowerCase().includes(flt)) continue;
       const d = document.createElement("div");
@@ -226,33 +434,73 @@ async function renderTree() {
       d.innerHTML = `<span class="idx">#${n.index}</span>` +
         `<span class="who p${n.player}">${n.player === 0 ? "OOP" : "IP"}</span>` +
         `<span>${n.path}</span>`;
-      d.onclick = async () => {
-        document.querySelectorAll(".tnode").forEach((x) => x.classList.remove("sel"));
-        d.classList.add("sel");
-        switchTab("strategy");
-        await selectNode(n.index);
+      d.onclick = () => {
+        // rebuild history from the path steps
+        const steps = n.path.split(" — ");
+        history = [{ node: 0, label: "(root)", who: 0 }];
+        for (const st of steps.slice(1)) {
+          const who = history[history.length - 1].who;
+          history.push({ node: null, label: st, who: 1 - who });
+        }
+        history[history.length - 1].node = n.index;
+        selectNode(n.index);
+        switchTab("matrix");
       };
-      el.appendChild(d);
+      el2.appendChild(d);
     }
-    $("tree-page").textContent = `page ${treePage + 1} / ${Math.ceil(r.total / PAGE)} (${r.total})`;
+    $("tree-page").textContent =
+      `page ${treePage + 1} / ${Math.ceil(r.total / PAGE)} (${r.total})`;
   } catch (e) { err("tree-list")(e); }
 }
 
-$("node-filter").addEventListener("input", () => renderTree());
-$("tree-prev").onclick = () => { if (treePage > 0) { treePage--; renderTree(); } };
-$("tree-next").onclick = () => { treePage++; renderTree(); };
+// ---------------- ranges ----------------
+async function renderRange(p) {
+  if (!active) return;
+  const r = await api("GET", `/solvers/${active}/range?player=${p === "oop" ? 0 : 1}`);
+  const by = {};
+  r.combos.forEach((c, i) => { by[comboClass(c).cls] = (by[comboClass(c).cls] || 0) + r.weights[i]; });
+  // per-class mean weight over its combos present in the range
+  const cnt = {};
+  r.combos.forEach((c) => { const k = comboClass(c).cls; cnt[k] = (cnt[k] || 0) + 1; });
+  const m = $("range-matrix");
+  m.innerHTML = "";
+  m.appendChild(el("div", "mxh", ""));
+  for (const r2 of RANKS_HIGH) m.appendChild(el("div", "mxh", r2));
+  let maxw = 0;
+  for (const cls in by) maxw = Math.max(maxw, by[cls] / cnt[cls]);
+  for (const ri of RANKS_HIGH) {
+    const h = el("div", "mxh rowh", ri);
+    h.style.display = "flex"; h.style.alignItems = "center";
+    m.appendChild(h);
+    for (const ci of RANKS_HIGH) {
+      const suited = ri !== ci && (RANK_VAL[ri] > RANK_VAL[ci]);
+      const cls = ri === ci ? ri + ci : (suited ? ri + ci + "s" : ci + ri + "o");
+      const cell = el("div", "mxcell");
+      if (by[cls]) {
+        const w = by[cls] / cnt[cls] / maxw;
+        cell.style.background = `rgba(62,201,122,${(0.12 + 0.75 * w).toFixed(3)})`;
+        cell.textContent = (by[cls] / cnt[cls]).toFixed(2);
+        cell.title = `${cls}: total weight ${(by[cls]).toFixed(2)} over ${cnt[cls]} combos`;
+      } else {
+        cell.innerHTML = '<span class="dead">–</span>';
+        cell.title = cls + ": not in range";
+      }
+      m.appendChild(cell);
+    }
+  }
+  $("range-detail").textContent =
+    `cells show the mean weight of the class's combos (max ${maxw.toFixed(3)})`;
+}
 
-// ---------------- root EV view ----------------
+// ---------------- root EV ----------------
 async function renderEv(p) {
   if (!active) return;
   const ev = await api("GET", `/solvers/${active}/root-ev`);
   const d = ev[p];
   const t = $("ev-table");
-  let html = "<thead><tr><th>hand</th><th>EV (chips)</th><th>vs range mass</th></tr></thead><tbody>";
-  // sort by EV descending
+  let html = "<thead><tr><th>hand</th><th>EV (chips)</th><th>range mass</th></tr></thead><tbody>";
   const order = d.ev.map((v, i) => [v, i]).sort((a, b) => b[0] - a[0]);
   for (const [v, i] of order) {
-    const w = v === 0 && d.mass[i] === 0 ? "dead" : (v / 1).toFixed(2);
     const col = v > 0 ? "var(--green)" : "var(--red)";
     html += `<tr><td class="combo">${d.cards[i]}</td>` +
       `<td style="color:${col}"><b>${v.toFixed(2)}</b></td>` +
@@ -260,9 +508,6 @@ async function renderEv(p) {
   }
   t.innerHTML = html + "</tbody>";
 }
-document.querySelectorAll("[data-evp]").forEach((b) => {
-  b.onclick = () => renderEv(b.dataset.evp);
-});
 
 // ---------------- tabs ----------------
 function switchTab(name) {
@@ -270,15 +515,27 @@ function switchTab(name) {
     t.classList.toggle("active", t.dataset.tab === name));
   document.querySelectorAll(".tab-body").forEach((t) =>
     t.classList.toggle("hidden", t.id !== "tab-" + name));
+  if (name === "tree") renderTree();
   if (name === "ev") renderEv("oop");
+  if (name === "ranges") renderRange("oop");
+  if (name === "matrix" && active && !currentStrategy) selectNode(0);
 }
 document.querySelectorAll(".tab").forEach((t) => {
   t.onclick = () => switchTab(t.dataset.tab);
 });
+document.querySelectorAll("[data-evp]").forEach((b) => {
+  b.onclick = () => renderEv(b.dataset.evp);
+});
+document.querySelectorAll("[data-rp]").forEach((b) => {
+  b.onclick = () => renderRange(b.dataset.rp);
+});
 
-// ---------------- session actions ----------------
+// ---------------- controls ----------------
 $("solve").onclick = solve;
 $("clear-board").onclick = () => { board = []; render(); };
+$("cancel-job").onclick = async () => {
+  if (active) await api("POST", `/solvers/${active}/cancel`, {});
+};
 $("continue-btn").onclick = () =>
   solverAction("continue", { max_iters: parseInt($("iters").value, 10) });
 $("to-target-btn").onclick = () => {
@@ -292,6 +549,7 @@ $("delete-btn").onclick = async () => {
   await api("DELETE", `/solvers/${active}`);
   active = null;
   $("stats").textContent = "no solution loaded";
+  $("matrix").innerHTML = "";
   await refreshSolvers();
 };
 $("save-btn").onclick = async () => {
@@ -307,22 +565,25 @@ $("load-btn").onclick = async () => {
   const name = prompt("solution file name:", "spot.sol");
   if (!name) return;
   try {
-    const r = await api("POST", "/solvers/load", { name });
+    const r = await api("POST", "/solvers/load", { name }, true);
     active = r.id;
+    history = [{ node: 0, label: "(root)", who: 0 }];
     await refreshSolvers();
     const st = await api("GET", `/solvers/${active}/stats`);
-    showStats(st);
+    showStats(st, `<div class="stat"><div class="v">${r.total_iterations}</div><div class="k">iters total</div></div>`);
     await selectNode(0);
   } catch (e) { err("stats")(e); }
 };
+$("node-filter").addEventListener("input", () => renderTree());
+$("tree-prev").onclick = () => { if (treePage > 0) { treePage--; renderTree(); } };
+$("tree-next").onclick = () => { treePage++; renderTree(); };
 
 // ---------------- boot ----------------
 (async () => {
   render();
   try {
     const h = await api("GET", "/health");
-    $("conn").textContent = `ok — up to ${h.max_solvers} solvers, ` +
-      `data dir ${h.data_dir}`;
+    $("conn").textContent = `ok — up to ${h.max_solvers} solvers`;
   } catch (e) { $("conn").textContent = "offline"; }
   await refreshSolvers();
 })();
