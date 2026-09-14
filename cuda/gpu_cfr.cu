@@ -21,6 +21,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -1100,7 +1101,7 @@ struct Compiler {
       runOff.resize(runOff.size() + 2 * (nb + 1), 0);
       // Build children first (they append their own map sections; ours are
       // reserved above and filled below).
-      std::vector<std::vector<int>> childLists[2];
+      std::vector<std::vector<int>> childLists[2], childParents[2];
       uint8_t nboard[5];
       for (int i = 0; i < nBoard; ++i) nboard[i] = board[i];
       const int64_t childPot = potBase + sc0 + sc1;
@@ -1108,26 +1109,37 @@ struct Compiler {
       for (int br = 0; br < nb; ++br) {
         const int c = branchCards[br];
         nboard[nBoard] = (uint8_t)c;
-        // Child combo lists: parent lists minus combos containing c.
-        std::vector<int> l0, l1;
+        // Child combo lists: parent lists minus combos containing c. The
+        // parent slot of each surviving entry is captured inline — the
+        // ctap/expIdx fills below used to rescan the parent list for
+        // every (branch, combo) pair, which was quadratic.
+        std::vector<int> l0, l1, par0, par1;
         for (int s = 0; s < nC0; ++s) {
           const int base = comboId[comboOff0 + s];
-          if (!sharesCardP(0, base, (uint8_t)c)) l0.push_back(base);
+          if (!sharesCardP(0, base, (uint8_t)c)) {
+            l0.push_back(base);
+            par0.push_back(s);
+          }
         }
         for (int s = 0; s < nC1; ++s) {
           const int base = comboId[comboOff1 + s];
-          if (!sharesCardP(1, base, (uint8_t)c)) l1.push_back(base);
+          if (!sharesCardP(1, base, (uint8_t)c)) {
+            l1.push_back(base);
+            par1.push_back(s);
+          }
         }
         const int off0 = (int)comboId.size();
         for (int v : l0) comboId.push_back(v);
         const int off1 = (int)comboId.size();
         for (int v : l1) comboId.push_back(v);
-        childLists[0].push_back(l0);
-        childLists[1].push_back(l1);
         nd.children.push_back(build(nboard, nBoard + 1, childPot, 0, 0,
                                      0, false, false, depth + 1, off0,
                                      (int)l0.size(), off1, (int)l1.size(),
                                      pc0 + sc0, pc1 + sc1));
+        childLists[0].push_back(std::move(l0));
+        childLists[1].push_back(std::move(l1));
+        childParents[0].push_back(std::move(par0));
+        childParents[1].push_back(std::move(par1));
       }
       // childToParent runs (forward reach; per player). The node's ctap
       // section is contiguous (children do not push ctap), so record the
@@ -1140,16 +1152,9 @@ struct Compiler {
         int total = 0;
         for (int br = 0; br < nb; ++br) {
           runOff[runBase + br] = total;
-          const std::vector<int>& cl = childLists[p][br];
-          for (int j = 0; j < (int)cl.size(); ++j) {
-            int pslot = -1;
-            for (int s = 0; s < parentN; ++s) {
-              if (comboId[parentOff + s] == cl[j]) {
-                pslot = s;
-                break;
-              }
-            }
-            ctap.push_back(pslot);
+          const std::vector<int>& cp = childParents[p][br];
+          for (int j = 0; j < (int)cp.size(); ++j) {
+            ctap.push_back(cp[j]);
             ++total;
           }
         }
@@ -1165,17 +1170,9 @@ struct Compiler {
         const int parentOff = p == 0 ? comboOff0 : comboOff1;
         std::vector<std::vector<std::pair<int, int>>> perSlot(parentN);
         for (int br = 0; br < nb; ++br) {
-          const std::vector<int>& cl = childLists[p][br];
-          for (int j = 0; j < (int)cl.size(); ++j) {
-            int pslot = -1;
-            for (int s = 0; s < parentN; ++s) {
-              if (comboId[parentOff + s] == cl[j]) {
-                pslot = s;
-                break;
-              }
-            }
-            perSlot[pslot].push_back({br, j});
-          }
+          const std::vector<int>& cp = childParents[p][br];
+          for (int j = 0; j < (int)cp.size(); ++j)
+            perSlot[cp[j]].push_back({br, j});
         }
         int cnt = 0;
         for (int s = 0; s < parentN; ++s) {

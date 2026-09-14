@@ -135,6 +135,17 @@ after each step):
    as its per-card scatter (barrier kept after the atomics — dropping
    it exposed a run-to-run nondeterminism on one gate spot, so it
    stays), and the graph now prints its node count.
+9. **Compile: quadratic chance-table scan removed**: the ctap and
+   expIdx fills rescanned the parent combo list for every (branch,
+   child combo) pair — O(branches x combos x parentN) per chance node,
+   billions of comparisons on flop trees. The parent slot is captured
+   inline while filtering the child list (it IS the filter index), so
+   both fills are O(entries). Instrumented phases: tree-build
+   1,644 -> 739 ms on the 615k flop tree (still chrono-inflated);
+   compile 2.67 s -> 1.76 s (1500-stack flop), 1.60 -> 0.73 s
+   (500-stack), 49.6 -> 35.2 s (the 11.7M wide flop). End-to-end to the
+   0.1-chip target: 500-stack flop 3.2 -> 2.1 s, 1500-stack 13.8 ->
+   11.1 s.
 8. **Reach-row aliasing (traffic, not compute)**: profiling the
    practical flop tree showed the iteration is DRAM-bandwidth-bound
    (~7 GB of row traffic per iteration vs the 4070's ~500 GB/s). The
