@@ -1362,6 +1362,26 @@ GpuPostflopSolver::GpuPostflopSolver(const PostflopSpot& spot,
   std::vector<int> vkind, vplayer, vfoldBy, vna, vchildBase, vnc0, vnc1,
       vcomboOff0, vcomboOff1, vreachOff, vregOff, vnBranch, vrunOffOff,
       vexpOffOff, vboardId, vchanceQ, vexpIdxBase, vctapBase;
+  {
+    const size_t N = cc.nodes.size();
+    vkind.reserve(N);
+    vplayer.reserve(N);
+    vfoldBy.reserve(N);
+    vna.reserve(N);
+    vchildBase.reserve(N);
+    vnc0.reserve(N);
+    vnc1.reserve(N);
+    vcomboOff0.reserve(N);
+    vcomboOff1.reserve(N);
+    vreachOff.reserve(N);
+    vnBranch.reserve(N);
+    vrunOffOff.reserve(N);
+    vexpOffOff.reserve(N);
+    vboardId.reserve(N);
+    vchanceQ.reserve(N);
+    vexpIdxBase.reserve(N);
+    vctapBase.reserve(N);
+  }
   std::vector<int64_t> vsc0, vsc1, vpotBase, vpc0, vpc1;
   size_t reachTotal = 0;
   size_t regTotal = 0;

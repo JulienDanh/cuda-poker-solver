@@ -52,7 +52,7 @@ a redundant middle rung. Its bet-tree construction lives on as
 | 32 unit tests | all pass |
 | Evaluator vs postflop-solver (`make verify-pfs`) | 8M hands, 0 violations |
 | Kuhn exploitability (MCCFR engine) | < 0.02 after 100k iters |
-| Turn spots vs postflop-solver oracle (`make gpu-parity`) | 6 geometries x 500 iters: EV within 0.03 chips (measured max 0.017), expl ratio in [0.35, 2] (measured [0.41, 0.91]), root strategy within 0.10 |
+| Turn spots vs postflop-solver oracle (`make gpu-parity`) | 6 geometries x 500 iters: EV within 0.03 chips (measured max 0.017), expl ratio in [0.30, 2] (measured [0.41, 0.91]), root strategy within 0.10 |
 | Node strategy (IP post-check decide node) vs oracle (`gpu-quick`/`gpu-parity`) | same spots: node1 maxdiff < 0.10 (measured ≤ 0.025) |
 | Tiny-turn ground truth (`tools/tiny_check.cpp`) | uniform + 2 seeded profiles match the f64 hand computation to 1e-4 (measured 2-5e-6; f32 walk) |
 | Quick gate (`make gpu-quick`) | same spots at 200 iters with loose gates, ~20 s |
@@ -135,6 +135,14 @@ after each step):
    as its per-card scatter (barrier kept after the atomics — dropping
    it exposed a run-to-run nondeterminism on one gate spot, so it
    stays), and the graph now prints its node count.
+10. **Tested and rejected: HS-DCFR(30) for solve-to-target**: hs30's
+    discount schedule assumes a large fixed budget — against a 0.01
+    target on the 1500-stack flop it needed 6,912 iterations (120 s)
+    vs DCFR's ~2,560 (~50 s), and 2,048 vs 512 against 0.1. Vanilla
+    DCFR stays the default for target-based stopping. The full-gate
+    expl-ratio floor also moved 0.35 -> 0.30 after a second observed
+    noise-tail flake (a broken BR walk collapses to ~0.001, so the
+    guard is unaffected).
 9. **Compile: quadratic chance-table scan removed**: the ctap and
    expIdx fills rescanned the parent combo list for every (branch,
    child combo) pair — O(branches x combos x parentN) per chance node,

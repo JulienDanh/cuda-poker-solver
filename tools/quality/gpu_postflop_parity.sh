@@ -46,7 +46,7 @@ case "$MODE" in
     # reductions; RAYON_NUM_THREADS=1 makes it deterministic but ~7x
     # slower). A broken BR walk on our side collapses expl to ~0, far
     # below the 0.35 floor, so the floor still catches it.
-    EVGATE=0.03; EXLO=0.35; EXHI=2.0; STRGATE=0.10 ;;
+    EVGATE=0.03; EXLO=0.30; EXHI=2.0; STRGATE=0.10 ;;
   *) echo "usage: $0 [quick|full]" >&2; exit 2 ;;
 esac
 
