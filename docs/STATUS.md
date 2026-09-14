@@ -332,6 +332,22 @@ after each step):
     cleared as noise: three re-runs span 4785-5288 it/s (~10% band,
     no kernel changes this round); loop re-run green.
 
+21. **Headless UI walkthrough (the deepest verification layer)**:
+    `test_pps_ui_flow.py` drives the ACTUAL app.js click handlers
+    through a complete study session — form fill, Solve spot, job
+    polling, action click (history + node EV chips), runout picker
+    open (49 cells with real per-card strategy bars), runout click
+    (history card step, dealt card on the board, turn matrix), and
+    the tree/ranges/EV tabs — with fetch bridged to the REAL FastAPI
+    app in-process (TestClient → pps → GPU engine) and the DOM state
+    asserted at each step. No canned data anywhere. The stub's DOM
+    is faithful (innerHTML/textContent assignments clear children,
+    like the real DOM). Building it surfaced a real robustness gap:
+    an empty bet abstraction silently solved a check-only tree —
+    the wrapper now rejects it ("pass at least one size"). Harness
+    lesson recorded: stub inputs default to "" (browsers load the
+    HTML value attr) — flow tests must set every input.
+
 Cumulative turn throughput: ~4.0x (wide 193 -> ~785, standard 1401 ->
 ~4,730, shortstack 96 -> ~87 us/iter); practical flop 56 -> ~58
 iters/s (1500 stack) and 201 -> ~211 (500 stack).

@@ -13,7 +13,7 @@ SRCS := src/cards.cpp src/common.cpp src/eval.cpp src/fgs.cpp src/hand169.cpp \
 HEADERS := $(wildcard src/*.h)
 BUILD := build
 
-.PHONY: all test verify-pfs stub-bias gpu-quick gpu-parity turn-bench flop-bench perf-loop python python-test api api-test ui-test ui-logic-test clean
+.PHONY: all test verify-pfs stub-bias gpu-quick gpu-parity turn-bench flop-bench perf-loop python python-test api api-test ui-test ui-logic-test ui-flow-test clean
 
 all: $(BUILD)/ppsolve
 
@@ -111,6 +111,13 @@ ui-test: api-test
 # Requires `pip install quickjs` (build needs a C compiler on PATH).
 ui-logic-test:
 	$(PYTHON) python/test_pps_ui.py
+
+# UI flow test (python/test_pps_ui_flow.py): drives the ACTUAL app.js
+# click handlers through a full study session (solve -> poll -> act ->
+# runout pick -> tabs) with fetch bridged to the real FastAPI app
+# in-process. The deepest UI verification.
+ui-flow-test:
+	$(PYTHON) python/test_pps_ui_flow.py
 
 clean:
 	rm -rf $(BUILD)

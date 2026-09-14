@@ -236,6 +236,9 @@ class Solver {
     cfg.betAllIn = sawAllIn;
     cfg.raiseMults = parseDoubleList(raises);
     cfg.maxRaises = maxRaises;
+    if (cfg.betFracs.empty() && !cfg.betAllIn && !cfg.betGeometric)
+      throw std::runtime_error(
+          "empty bet abstraction: pass at least one size (e.g. \"0.75,a\")");
     // The compile (tree build + upload) is the heavy part and touches
     // no Python objects — release the GIL so other threads (an API
     // server) keep serving during it.
