@@ -66,6 +66,15 @@ class GpuPostflopSolver {
   // Range-weighted average frequencies of the root (OOP) actions.
   std::vector<double> rootStrategy();
 
+  // Range-weighted average frequencies of decide node `decideIdx` (the
+  // decideMeta order: 0 = root, 1 = IP's first decision after OOP
+  // checks, ...). Returns {} for anything but a first-street decision:
+  // deeper (chance-compacted) nodes would need reach-weighted averaging,
+  // and the range-weighted aggregate is exact only where the deciding
+  // player has no earlier action on the path (the root, and each
+  // player's first decision of the street).
+  std::vector<double> nodeStrategy(int decideIdx);
+
   int numNodes() const { return numNodes_; }
   int maxDepth() const { return maxDepth_; }
 

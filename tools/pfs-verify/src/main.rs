@@ -169,6 +169,34 @@ fn run_solve(game: &mut PostFlopGame, pot: i32, iters: u32, target: f32) -> Resu
         println!("EV {} {:.6}", p, evsum / wsum);
     }
     println!("EXPLOITABILITY {:.6}", expl);
+    // Node strategy of IP's first decision (root action 0 = OOP checks),
+    // aggregated the same way as the root: range-weighted average of the
+    // per-hand strategy rows at that node.
+    game.play(0);
+    if !game.is_terminal_node() && !game.is_chance_node()
+        && game.current_player() == 1
+    {
+        game.cache_normalized_weights();
+        let hands = game.private_cards(1);
+        let strategy = game.strategy();
+        let w = game.normalized_weights(1);
+        let num_hands = hands.len();
+        let num_actions = strategy.len() / num_hands;
+        let mut wsum = 0.0;
+        let mut freq = vec![0.0f32; num_actions];
+        for i in 0..num_hands {
+            for a in 0..num_actions {
+                freq[a] += w[i] * strategy[a * num_hands + i];
+            }
+            wsum += w[i];
+        }
+        print!("NODESTRAT");
+        for f in &mut freq {
+            *f /= wsum;
+            print!(" {:.6}", f);
+        }
+        println!();
+    }
     Ok(())
 }
 

@@ -73,7 +73,7 @@ run_spot() {
     *) echo "bad board $board" >&2; exit 2 ;;
   esac
   ours=$("$GPU" postflop "$board" "$oopr" "$ipr" "$pot" "$stack" "$bets" \
-         "$raises" "$iters" --algo dcfr --root 2>/dev/null)
+         "$raises" "$iters" --algo dcfr --root --strat 1 2>/dev/null)
   theirs=$("$PFS" "$sub" "$board" "$oopr" "$ipr" "$pot" "$stack" "$pbets" \
            "$praises" "$iters" 2>/dev/null)
   ev0o=$(echo "$ours" | grep "^EV 0" | awk '{print $3}')
@@ -82,24 +82,36 @@ run_spot() {
   ext=$(echo "$theirs" | grep EXPLOIT | awk '{print $2}')
   rso=$(echo "$ours" | grep ROOTSTRAT | cut -d' ' -f2-)
   rst=$(echo "$theirs" | grep ROOTSTRAT | cut -d' ' -f2-)
+  # IP's first decision after OOP checks (decide node 1) vs the oracle's
+  # same node (reached by playing the root check).
+  nso=$(echo "$ours" | grep "^STRAT" | cut -d' ' -f3-)
+  nst=$(echo "$theirs" | grep NODESTRAT | cut -d' ' -f2-)
   result=$(awk -v a="$ev0o" -v b="$ev0t" -v x="$exo" -v y="$ext" \
               -v ro="$rso" -v rt="$rst" -v gate="$EVGATE" \
+              -v no="$nso" -v nt="$nst" \
               -v xlo="$EXLO" -v xhi="$EXHI" -v sgate="$STRGATE" 'BEGIN {
     d = a - b; if (d < 0) d = -d
     if (y <= 0) r = 1; else r = x / y
     m = 0; n = split(ro, A, " "); split(rt, B, " ")
     for (i = 1; i <= n; i++) { t = A[i] - B[i]; if (t < 0) t = -t; if (t > m) m = t }
+    nm = -1; k = split(no, C, " "); tl = split(nt, D, " ")
+    if (k == 0 && tl > 0) nm = 1; else if (k == 0) nm = 0; else {
+      nm = 0
+      for (i = 1; i <= k; i++) { t = C[i] - D[i]; if (t < 0) t = -t; if (t > nm) nm = t }
+    }
     evok = (d < gate) ? 1 : 0
     exok = (r >= xlo && r <= xhi) ? 1 : 0
     rsok = (m < sgate) ? 1 : 0
+    nsok = (nm >= 0 && nm < sgate) ? 1 : 0
     status = "OK"
     if (!evok) status = "FAIL(ev)"
     if (!exok) status = status "=FAIL(expl)"
     if (!rsok) status = status "=FAIL(strat)"
-    printf "%.6f %.4f %.4f %s", d, r, m, status
+    if (!nsok) status = status "=FAIL(nstrat)"
+    printf "%.6f %.4f %.4f %.4f %s", d, r, m, nm, status
   }')
-  status=$(echo "$result" | awk '{print $4}')
-  echo "$board pot=$pot stack=$stack iters=$iters: EV diff=$(echo "$result" | awk '{print $1}')  expl ratio=$(echo "$result" | awk '{print $2}')  strat maxdiff=$(echo "$result" | awk '{print $3}')  [$status]"
+  status=$(echo "$result" | awk '{print $5}')
+  echo "$board pot=$pot stack=$stack iters=$iters: EV diff=$(echo "$result" | awk '{print $1}')  expl ratio=$(echo "$result" | awk '{print $2}')  strat maxdiff=$(echo "$result" | awk '{print $3}')  node1 maxdiff=$(echo "$result" | awk '{print $4}')  [$status]"
   if [ "$status" != "OK" ]; then fail=1; fi
 }
 

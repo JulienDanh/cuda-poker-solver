@@ -591,6 +591,7 @@ uint64_t handKey(const HandValue& v) {
 struct GpuPostflopSolver::Impl {
   int numNodes = 0, maxDepth = 0;
   int n0Base = 0, n1Base = 0, maxNa = 1;
+  int spotNBoard = 0;
   size_t reachTotal = 0, regTotal = 0;
   int64_t pot = 0;
   bool empty = false;
@@ -654,10 +655,10 @@ struct GpuPostflopSolver::Impl {
 
   // host copies for stats
   std::vector<double> w0, w1;
-  // decide-node table for the strategy seeder: (regOff, na, player, nC,
-  // depth)
+  // decide-node table for the strategy seeder and nodeStrategy():
+  // (regOff, na, player, nC, depth, nBoard)
   struct NodeMeta {
-    int regOff, na, player, nC, depth;
+    int regOff, na, player, nC, depth, nBoard;
   };
   std::vector<NodeMeta> decideMeta;
   std::vector<uint8_t> baseCards0, baseCards1;
@@ -1227,6 +1228,7 @@ GpuPostflopSolver::GpuPostflopSolver(const PostflopSpot& spot,
   const int n0 = cc.sides[0].n, n1 = cc.sides[1].n;
   I->n0Base = n0;
   I->n1Base = n1;
+  I->spotNBoard = spot.nBoard;
   if (n0 == 0 || n1 == 0) {
     I->empty = true;
     return;
@@ -1494,7 +1496,8 @@ GpuPostflopSolver::GpuPostflopSolver(const PostflopSpot& spot,
     const NodeH& nd = cc.nodes[u];
     if (nd.kind != kDecide) continue;
     I->decideMeta.push_back({vregOff[u], nd.na, nd.player,
-                             nd.player == 0 ? nd.nC0 : nd.nC1, nd.depth});
+                             nd.player == 0 ? nd.nC0 : nd.nC1, nd.depth,
+                             nd.nBoard});
   }
 
   // Host copies for stats.
@@ -1646,6 +1649,50 @@ pf::NodeStats GpuPostflopSolver::stats() {
   st.expl = (V0 + V1 - (double)I->pot) / 2.0;
   st.pairMass = (int64_t)(Z * (1LL << 20));
   return st;
+}
+
+std::vector<double> GpuPostflopSolver::nodeStrategy(int decideIdx) {
+  Impl* I = impl_;
+  if (I->empty || decideIdx < 0 ||
+      decideIdx >= (int)I->decideMeta.size())
+    return {};
+  const auto& m = I->decideMeta[decideIdx];
+  // Only first-street nodes share the root's combo lists, whose comboId
+  // entries are the identity base slots of the deciding player. Deeper
+  // (chance-compacted) nodes would need reach-weighted averaging instead.
+  if (m.nBoard != I->spotNBoard) return {};
+  const int nC = m.nC;
+  const int na = m.na;
+  // First-street decide nodes share the root's combo lists, whose
+  // comboId entries are the identity base slots of the deciding player
+  // (each side's slots are 0-based into its own w0/w1 vector).
+  std::vector<float> rows((size_t)na * nC);
+  GPU_CHECK(cudaMemcpy(rows.data(), I->dStrat + (size_t)m.regOff,
+                       (size_t)na * nC * sizeof(float),
+                       cudaMemcpyDeviceToHost));
+  const std::vector<double>& w = m.player == 0 ? I->w0 : I->w1;
+  std::vector<double> freq(na, 0.0), comboTot(nC, 0.0);
+  double z = 0.0;
+  for (int c = 0; c < nC; ++c) {
+    double s = 0.0;
+    for (int a = 0; a < na; ++a)
+      s += rows[(size_t)a * nC + c];
+    comboTot[c] = s;
+    z += w[c];
+  }
+  if (z <= 0.0) return freq;
+  const double uniform = 1.0 / na;
+  for (int a = 0; a < na; ++a) {
+    double acc = 0.0;
+    for (int c = 0; c < nC; ++c) {
+      const double sigma =
+          comboTot[c] > 0.0 ? rows[(size_t)a * nC + c] / comboTot[c]
+                            : uniform;
+      acc += w[c] * sigma;
+    }
+    freq[a] = acc / z;
+  }
+  return freq;
 }
 
 std::vector<double> GpuPostflopSolver::rootStrategy() {

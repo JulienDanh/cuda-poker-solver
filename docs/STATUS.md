@@ -1,8 +1,8 @@
 # Project status
 
 Where the solver stands, what is validated, and what is missing.
-Last updated: after the multi-street GPU turn milestone (f32 hot path,
-turn-oracle parity, turn-only focus).
+Last updated: after the strategy-output milestone (per-node first-street
+strategy query, node-1 oracle parity).
 
 ## 0. Scope
 
@@ -54,6 +54,7 @@ a redundant middle rung. Its bet-tree construction lives on as
 | Evaluator vs postflop-solver (`make verify-pfs`) | 8M hands, 0 violations |
 | Kuhn exploitability (MCCFR engine) | < 0.02 after 100k iters |
 | Turn spots vs postflop-solver oracle (`make gpu-parity`) | 6 geometries x 500 iters: EV within 0.01 chips (measured max 0.0034), expl ratio in [0.5, 2] (measured [0.64, 1.13]), root strategy within 0.10 |
+| Node strategy (IP post-check decide node) vs oracle (`gpu-quick`/`gpu-parity`) | same spots: node1 maxdiff < 0.10 (measured ≤ 0.025) |
 | Tiny-turn ground truth (`tools/tiny_check.cpp`) | uniform + 2 seeded profiles match the f64 hand computation to 1e-4 (measured 2-5e-6; f32 walk) |
 | Quick gate (`make gpu-quick`) | same spots at 200 iters with loose gates, ~20 s |
 | Chip payoffs (engine invariants) | zero-sum for fold/all-in/continuation/multi-street |
@@ -120,9 +121,12 @@ Cumulative turn throughput: ~3.5x (wide 193 -> ~700, standard 1401 ->
    (`make gpu-quick`/`gpu-parity`) and `turn-bench` cover turn only, by
    decision, until the turn perf work lands. The oracle flop solves are
    also ~50x the turn cost per iteration, which would slow the loop.
-4. **Strategy output** — only the root aggregate is exposed (`--root`).
-   No per-node strategy dump, no save/load of trained solutions, no
-   spot-query interface.
+4. **Strategy output** — the root aggregate (`--root`) and the
+   range-weighted average strategy of any first-street decide node
+   (`--strat <idx>`, 0 = root, 1 = IP after OOP checks) are exposed;
+   deeper (chance-compacted) nodes would need reach-weighted averaging
+   and return nothing. Still missing: save/load of trained solutions,
+   a spot-query interface.
 5. **Exploitability** is measured per solve (EV + BR walk) but there is
    no multiway (3+ player) support at all in the GPU engine.
 6. **No continuous integration**; the gates are run manually.
@@ -170,4 +174,5 @@ before a commit. The tiny ground truth is engine-independent (a hand
 3. Then flop spots: add 3-card boards back to the gates with
    `pfs-verify solve` (already exposed), at reduced iteration counts
    (the oracle flop solve is ~30 s at 300 iterations).
-4. Then: per-node strategy dump / save-load / spot query (item 4).
+4. Then: save-load of trained solutions / spot query (item 4; the
+   per-node first-street strategy query `--strat` landed).

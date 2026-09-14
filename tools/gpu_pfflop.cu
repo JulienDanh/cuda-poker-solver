@@ -4,6 +4,7 @@
 //
 //   gpu_pfflop postflop <board> <oop_range> <ip_range> <pot> <stack>
 //             <bets> <raises> <iters> [--algo dcfr|hs30] [--root]
+//             [--strat <decide_idx>]
 //
 // Prints (plus GPU timings on stderr):
 //   EV 0 <chips> / EV 1 <chips> / EXPLOITABILITY <chips>
@@ -105,7 +106,12 @@ int main(int argc, char** argv) {
     std::fprintf(stderr,
                   "usage: gpu_pfflop postflop <board> <oop_range> <ip_range> "
                   "<pot> <stack> <bets> <raises> <iters> "
-                  "[--algo dcfr|hs30] [--root]\n"
+                  "[--algo dcfr|hs30] [--root] [--strat <decide_idx>]\n"
+                  "  --strat: print STRAT <idx> with the range-weighted "
+                  "average frequencies of\n"
+                  "    that decide node (0 = root, 1 = IP after OOP "
+                  "checks; first-street nodes\n"
+                  "    only; repeats keep the last idx)\n"
                   "  board: 3, 4 or 5 cards (flop / turn / river)\n");
     return 2;
   }
@@ -133,6 +139,7 @@ int main(int argc, char** argv) {
   int iters = std::stoi(argv[9]);
   std::string algo = "dcfr";
   bool rootStrat = false;
+  int stratNode = -1;
   double target = -1.0;
   for (int i = 10; i < argc; ++i) {
     if (std::strcmp(argv[i], "--algo") == 0 && i + 1 < argc) {
@@ -145,6 +152,8 @@ int main(int argc, char** argv) {
       if (iters < 100000) iters = 100000;
     } else if (std::strcmp(argv[i], "--max-raises") == 0 && i + 1 < argc) {
       cfg.maxRaises = std::atoi(argv[++i]);
+    } else if (std::strcmp(argv[i], "--strat") == 0 && i + 1 < argc) {
+      stratNode = std::atoi(argv[++i]);
     }
   }
 
@@ -179,6 +188,12 @@ int main(int argc, char** argv) {
     auto rs = solver.rootStrategy();
     std::printf("ROOTSTRAT");
     for (double f : rs) std::printf(" %.6f", f);
+    std::printf("\n");
+  }
+  if (stratNode >= 0) {
+    auto ns = solver.nodeStrategy(stratNode);
+    std::printf("STRAT %d", stratNode);
+    for (double f : ns) std::printf(" %.6f", f);
     std::printf("\n");
   }
   auto st = solver.stats();
