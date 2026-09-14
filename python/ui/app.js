@@ -187,6 +187,9 @@ async function refreshSolvers() {
       `<span class="id">${s.total_iterations} iters</span>`;
     d.onclick = async () => {
       active = s.id;
+      // show THIS solver's board (the spot it was compiled with)
+      board = (s.board.match(/.{2}/g) || []);
+      render();
       history = [{ node: 0, label: "(root)", who: 0 }];
       await refreshSolvers();
       const st = await api("GET", `/solvers/${active}/stats`);
@@ -239,7 +242,6 @@ function renderMatrix(classes) {
       const cell = el("div", "mxcell");
       const d = classes ? classes[cls] : null;
       if (d && d.n > 0 && d.evs && d.evs.length) {
-        // EV mode: diverging color around 0, intensity by EV/pot
         const mean = d.evs.reduce((a, b) => a + b, 0) / d.evs.length;
         const ratio = Math.max(-1, Math.min(1, mean / pot));
         const alpha = (0.12 + 0.72 * Math.abs(ratio)).toFixed(3);
@@ -255,7 +257,7 @@ function renderMatrix(classes) {
             `<b>${cls}</b> — EV <b>${mean.toFixed(1)}</b> ` +
             `(mean of ${d.evs.length} live combos)`;
         };
-      } else if (d && d.n > 0 && !d.evs) {
+      } else if (d && d.n > 0) {
         // frequency mode: stacked action frequencies as the background
         const stops = [];
         let acc = 0;
@@ -335,9 +337,9 @@ function renderSpot(nav) {
   history.forEach((s, i) => {
     if (i > 0) h.appendChild(el("span", "dim", "→"));
     const c = el("div", "crumb" + (i === history.length - 1 ? " here" : ""));
-    const who = i === 0 ? "" :
+    const whoSpan = s.who == null ? "" :
       `<span class="who p${s.who}">${s.who === 0 ? "OOP" : "IP"}</span> `;
-    c.innerHTML = who + s.label;
+    c.innerHTML = whoSpan + s.label;
     c.onclick = () => {
       history = history.slice(0, i + 1);
       selectNode(s.node);
@@ -499,12 +501,18 @@ async function renderTree() {
         `<span class="who p${n.player}">${n.player === 0 ? "OOP" : "IP"}</span>` +
         `<span>${n.path}</span>`;
       d.onclick = () => {
-        // rebuild history from the path steps
+        // rebuild the history from the path: decide actions alternate
+        // the actor (heads-up), deal steps carry no actor
         const steps = n.path.split(" — ");
         history = [{ node: 0, label: "(root)", who: 0 }];
+        let who = 0;
         for (const st of steps.slice(1)) {
-          const who = history[history.length - 1].who;
-          history.push({ node: null, label: st, who: 1 - who });
+          if (st === "deal") {
+            history.push({ node: null, label: "deal", who: null });
+            continue;
+          }
+          history.push({ node: null, label: st, who });
+          who = 1 - who;
         }
         history[history.length - 1].node = n.index;
         selectNode(n.index);
@@ -674,6 +682,8 @@ $("tree-next").onclick = () => { treePage++; renderTree(); };
 // ---------------- boot ----------------
 (async () => {
   render();
+  document.querySelectorAll("[data-mx]").forEach((x) =>
+    x.classList.toggle("active", x.dataset.mx === matrixMode));
   try {
     const h = await api("GET", "/health");
     $("conn").textContent = `ok — up to ${h.max_solvers} solvers`;

@@ -267,6 +267,21 @@ after each step):
     table with per-action columns at the current node. Perf-loop and
     quick gate green (no regression).
 
+17. **UI verification + fixes**: the UI's JS logic is now actually
+    executed in tests — `test_pps_ui.py` runs `ui/app.js` inside a
+    real JS engine (quickjs) with a DOM stub and REAL solver data
+    (class naming, the freq matrix's stacked gradients summing to 100,
+    the EV matrix, action EVs). It immediately caught a live bug: the
+    freq matrix rendered all cells dead — the EV-mode branch keyed on
+    `!d.evs` but classes carry an empty `evs: []` (truthy), so no cell
+    ever reached the frequency path; the browser would have shown an
+    all-dead matrix. Also fixed: selecting a solver now shows ITS
+    board (the spot it was compiled with), and history chips color
+    actors correctly through deal steps (deals carry no actor).
+    End-to-end verified against the live server: the exact call
+    sequence the UI makes (solve job + poll, strategy/node-nav/
+    node-ev/stats, tree, ranges, save/load, warm continue, delete).
+
 Cumulative turn throughput: ~4.0x (wide 193 -> ~785, standard 1401 ->
 ~4,730, shortstack 96 -> ~87 us/iter); practical flop 56 -> ~58
 iters/s (1500 stack) and 201 -> ~211 (500 stack).

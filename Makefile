@@ -13,7 +13,7 @@ SRCS := src/cards.cpp src/common.cpp src/eval.cpp src/fgs.cpp src/hand169.cpp \
 HEADERS := $(wildcard src/*.h)
 BUILD := build
 
-.PHONY: all test verify-pfs stub-bias gpu-quick gpu-parity turn-bench flop-bench perf-loop python python-test api api-test ui-test clean
+.PHONY: all test verify-pfs stub-bias gpu-quick gpu-parity turn-bench flop-bench perf-loop python python-test api api-test ui-test ui-logic-test clean
 
 all: $(BUILD)/ppsolve
 
@@ -104,6 +104,13 @@ api-test: python
 # Alias: the UI's checks live in the api test suite (static serving +
 # path labels). `make api` serves the UI at http://127.0.0.1:8070/ui/.
 ui-test: api-test
+
+# UI logic tests (python/test_pps_ui.py): runs ui/app.js inside a real
+# JS engine (quickjs) with a DOM stub against real solver data — the
+# 13x13 aggregation, freq/EV matrix rendering, class naming.
+# Requires `pip install quickjs` (build needs a C compiler on PATH).
+ui-logic-test:
+	$(PYTHON) python/test_pps_ui.py
 
 clean:
 	rm -rf $(BUILD)
