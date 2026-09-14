@@ -22,6 +22,8 @@ add_library(ppcore STATIC
 target_include_directories(ppcore PUBLIC src)
 find_package(Threads REQUIRED)
 target_link_libraries(ppcore PUBLIC Threads::Threads)
+# The Python bindings link ppcore into a shared module.
+set_property(TARGET ppcore PROPERTY POSITION_INDEPENDENT_CODE ON)
 
 # Solver CLI.
 add_executable(ppsolve src/main.cpp)
@@ -58,6 +60,34 @@ if(ENABLE_CUDA)
     add_executable(gpu_pfflop tools/gpu_pfflop.cu cuda/gpu_cfr.cu)
     target_include_directories(gpu_pfflop PRIVATE ${CMAKE_SOURCE_DIR}/cuda)
     target_link_libraries(gpu_pfflop PRIVATE ppcore CUDA::cudart)
+    # Python bindings (the pps package, python/). Requires pybind11 in
+    # the target interpreter's env: python -m pip install pybind11 numpy.
+    # Point CMake at the right interpreter with -DPython3_EXECUTABLE=...
+    find_package(Python3 COMPONENTS Interpreter Development.Module QUIET)
+    if(Python3_Development.Module_FOUND)
+      execute_process(
+        COMMAND ${Python3_EXECUTABLE} -m pybind11 --cmakedir
+        OUTPUT_VARIABLE PYBIND11_CMAKEDIR
+        OUTPUT_STRIP_TRAILING_WHITESPACE
+        RESULT_VARIABLE PYBIND11_RES)
+      if(PYBIND11_RES EQUAL 0)
+        find_package(pybind11 CONFIG QUIET HINTS ${PYBIND11_CMAKEDIR})
+        if(pybind11_FOUND)
+          pybind11_add_module(pps_native python/pps_native.cpp cuda/gpu_cfr.cu)
+          target_include_directories(pps_native PRIVATE ${CMAKE_SOURCE_DIR}/cuda)
+          target_link_libraries(pps_native PRIVATE ppcore CUDA::cudart)
+          set_target_properties(pps_native PROPERTIES
+            LIBRARY_OUTPUT_DIRECTORY ${CMAKE_SOURCE_DIR}/python/pps)
+          message(STATUS "Python bindings enabled (pps_native)")
+        else()
+          message(STATUS "pybind11 cmake config not found; skipping Python bindings")
+        endif()
+      else()
+        message(STATUS "${Python3_EXECUTABLE} cannot import pybind11; skipping Python bindings")
+      endif()
+    else()
+      message(STATUS "Python3 Development.Module not found; skipping Python bindings")
+    endif()
   else()
     message(STATUS "CUDA toolkit not found; building CPU-only")
   endif()

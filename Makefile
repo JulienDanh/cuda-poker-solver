@@ -13,7 +13,7 @@ SRCS := src/cards.cpp src/common.cpp src/eval.cpp src/fgs.cpp src/hand169.cpp \
 HEADERS := $(wildcard src/*.h)
 BUILD := build
 
-.PHONY: all test verify-pfs stub-bias gpu-quick gpu-parity turn-bench flop-bench perf-loop clean
+.PHONY: all test verify-pfs stub-bias gpu-quick gpu-parity turn-bench flop-bench perf-loop python python-test clean
 
 all: $(BUILD)/ppsolve
 
@@ -74,6 +74,21 @@ perf-loop:
 # Flop benchmark: bets 0.4 pot + all-in, raises 2.5x (see bench_flop.sh).
 flop-bench:
 	tools/quality/bench_flop.sh
+
+# Python bindings (the pps package, python/): builds pps_native into
+# python/pps/. Requires pybind11 + numpy in the active Python env
+# (python -m pip install pybind11 numpy) and the CUDA toolkit.
+PYTHON ?= $(shell command -v python3)
+python:
+	cmake -B build-cuda -DENABLE_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=89 \
+	  -DPython3_EXECUTABLE=$(PYTHON) .
+	cmake --build build-cuda --target pps_native -j8
+
+# pps package tests (see python/test_pps.py): API invariants — labeled
+# actions, per-combo normalization, EV aggregation, save/load and
+# warm-start equivalence. Complements the oracle gates.
+python-test: python
+	$(PYTHON) python/test_pps.py
 
 clean:
 	rm -rf $(BUILD)

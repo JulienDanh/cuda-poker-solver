@@ -41,10 +41,58 @@ struct PostflopSpot {
   int64_t stack = 0;
 };
 
+// One action of a decide node, labeled with chips: kind is the
+// abstraction action and amount is the street-level total contribution
+// for Bet/Raise/AllIn (0 for Fold/Check/Call). Amounts are in chips, so
+// the same abstraction yields the same labels across callers.
+struct ActionLabel {
+  pf::ActionKind kind = pf::ActionKind::Check;
+  int64_t amount = 0;
+};
+
+// A decide node's static structure (tree introspection).
+struct DecideNodeInfo {
+  int nodeId = 0;   // global tree index
+  int player = 0;   // 0 = OOP, 1 = IP
+  int depth = 0;
+  int nBoard = 0;   // cards on the board at this node
+  int nCombos = 0;  // the deciding player's combos here
+  std::vector<ActionLabel> actions;
+  std::vector<int> children;  // global node id per action (aligned with actions)
+};
+
+// Per-combo strategy of a decide node: the average-strategy frequency
+// of each action for each of the node's combos. `combos` indexes the
+// deciding player's base list (the same list comboStrategy always
+// returns; `playerCards` maps it to cards); `freqs` is action-major
+// (freqs[a * combos.size() + c]).
+struct ComboStrategy {
+  std::vector<ActionLabel> actions;
+  std::vector<int> combos;
+  std::vector<double> freqs;
+};
+
+// Per-combo root values against the average strategy, in chips: the EV
+// of holding each combo vs the opponent's full (board-filtered) range.
+// combos[p] indexes player p's base list, ev[p] aligns with it, and
+// mass[p] is the opponent's valid range weight against that combo (the
+// per-combo EV normalizer; Σ w[p]*mass[p]*ev[p] / Σ w[p]*mass[p] is the
+// aggregate root EV of player p).
+struct ComboEv {
+  std::vector<int> combos[2];
+  std::vector<double> ev[2];
+  std::vector<double> mass[2];
+};
+
 class GpuPostflopSolver {
  public:
   // Compiles the spot to device dataflow (tree build + upload).
   GpuPostflopSolver(const PostflopSpot& spot, const pf::BetConfig& cfg);
+  // Loads a saved solution file (see save()): recompiles the spot
+  // recorded in the file and restores the trained rows and the discount
+  // schedule state. Throws std::runtime_error on IO/format errors or if
+  // the file's compiled tree no longer matches this engine version.
+  explicit GpuPostflopSolver(const std::string& solutionPath);
   ~GpuPostflopSolver();
   GpuPostflopSolver(const GpuPostflopSolver&) = delete;
   GpuPostflopSolver& operator=(const GpuPostflopSolver&) = delete;
@@ -53,11 +101,29 @@ class GpuPostflopSolver {
   // algo: "dcfr" or "hs30". If target > 0, the solve stops early once
   // the exploitability (checked every 128 iterations via two BR walks)
   // drops to or below it; iterationsRun() reports how many ran.
+  // A fresh solve: zeroes any previously accumulated rows and restarts
+  // the discount schedule (see reset() / continueSolve()).
   void solve(int iterations, const std::string& algo, double target = -1.0);
 
-  // Iterations executed by the last solve() call (early-stopped counts
-  // included).
+  // Continues the current solution for up to `iterations` more
+  // iterations (DCFR's discount staircase depends only on the
+  // cumulative iteration index, so the schedule continues exactly where
+  // solve() left off). Throws if the last solve used "hs30" (its
+  // schedule depends on the planned iteration count, so continuation
+  // is not defined). Requires a prior solve() call.
+  void continueSolve(int iterations, double target = -1.0);
+
+  // Zeroes the regret/strategy rows and the schedule: back to an
+  // untrained solver with the same compiled tree.
+  void reset();
+
+  // Iterations executed by the last solve()/continueSolve() call
+  // (early-stopped counts included).
   int iterationsRun() const { return iterationsRun_; }
+
+  // Cumulative iterations across solve()/continueSolve() since the
+  // last reset() (or construction, or a solution load).
+  int64_t totalIterations() const { return totalIters_; }
 
   // Final walks (EV + best response against the average strategy);
   // call after solve().
@@ -75,8 +141,40 @@ class GpuPostflopSolver {
   // player's first decision of the street).
   std::vector<double> nodeStrategy(int decideIdx);
 
+  // Tree introspection. decideIdx orders the decide nodes in global
+  // node order (same order as nodeStrategy / comboStrategy).
+  int numDecideNodes() const;
+  DecideNodeInfo decideNode(int decideIdx) const;
+
+  // Per-combo average-strategy frequencies of any decide node —
+  // including chance-compacted ones (per-combo frequencies need no
+  // range weighting, unlike nodeStrategy's first-street-only
+  // aggregate). Rows are normalized per combo; combos with a zero
+  // strategy sum (unreached, e.g. vs a pure fold) return uniform.
+  ComboStrategy comboStrategy(int decideIdx);
+
+  // Per-combo root EVs vs the average strategy (two value walks).
+  ComboEv rootEvPerCombo();
+
+  // The base combo lists the solver was compiled with: cards[2*i],
+  // cards[2*i+1] is combo slot i of player p's range (board-filtered,
+  // positive-weight only — the same slots combos[] refers to).
+  std::vector<uint8_t> playerCards(int player) const;
+
+  // The number of base combos per player (playerCards(p).size()/2).
+  int numBaseCombos(int player) const;
+
+  // The compiled range weights per player, aligned with playerCards(p)
+  // (board-filtered, positive-weight only).
+  std::vector<double> playerWeights(int player) const;
+
   int numNodes() const { return numNodes_; }
   int maxDepth() const { return maxDepth_; }
+
+  // Serializes the compiled spot, the bet config and the trained
+  // regret/strategy-sum rows plus the schedule state. The file is
+  // self-describing: the load constructor rebuilds the tree from it.
+  void save(const std::string& path) const;
 
   // Debug: host-side sums of the device buffers (GPU_CFR_DEBUG=1).
   void debugDump();
@@ -87,6 +185,13 @@ class GpuPostflopSolver {
   int numNodes_ = 0;
   int maxDepth_ = 0;
   int iterationsRun_ = 0;
+  int64_t totalIters_ = 0;
+
+  // Shared by both constructors: compile + upload, then optional rows.
+  void init(const PostflopSpot& spot, const pf::BetConfig& cfg);
+  // Graph replay in 128-iteration chunks from the current schedule
+  // state; updates iterationsRun_ / totalIters_.
+  void replayChunks(int iterations, double target);
 };
 
 }  // namespace gpu

@@ -27,7 +27,9 @@
 #include <cstdlib>
 #include <cstring>
 #include <deque>
+#include <limits>
 #include <map>
+#include <stdexcept>
 #include <vector>
 
 namespace pps {
@@ -688,6 +690,8 @@ struct GpuPostflopSolver::Impl {
   float* dCoefDummy = nullptr;
   int* dCounter = nullptr;
   int* dCounterDummy = nullptr;
+  size_t coefCap = 0;  // coefTab capacity (entries, not floats)
+  bool coefMoved = false;  // tab realloc'd: the graph must recapture
   bool capturing = false;
 
   std::vector<int*> dDecideList, dChanceList, dBwdList, dChanceBrOff;
@@ -700,11 +704,21 @@ struct GpuPostflopSolver::Impl {
   // decide-node table for the strategy seeder and nodeStrategy():
   // (regOff, na, player, nC, depth, nBoard)
   struct NodeMeta {
-    int regOff, na, player, nC, depth, nBoard;
+    int regOff, na, player, nC, depth, nBoard, nodeId, actBase;
   };
   std::vector<NodeMeta> decideMeta;
   std::vector<uint8_t> baseCards0, baseCards1;
   std::vector<int> sameOther0;
+  // host copies for tree introspection / per-combo queries / save():
+  // the flat child table with per-node offsets, the global combo list
+  // with per-node (side-specific) offsets, the labeled actions flat
+  // table, and the compiled spot + bet config (identity of the file).
+  std::vector<int> hChildBase, hChildFlat, hComboId, hComboOff0,
+      hComboOff1, hNC0, hNC1, sameOther1;
+  std::vector<pf::TreeAction> actFlat;
+  PostflopSpot spot;
+  pf::BetConfig cfg;
+  std::string lastAlgo;
   std::vector<int> rootCombos0;
   int rootNa = 0, rootRegOff = 0;
   std::vector<float> rootStratRows;
@@ -808,6 +822,46 @@ struct GpuPostflopSolver::Impl {
         GPU_CHECK(cudaGetLastError());
       }
     }
+  }
+
+  // The captured graph's kernel parameters embed the coefTab pointer,
+  // so it must be recaptured whenever the tab moves (solve() grows it);
+  // every other buffer it references is allocated once and stable.
+  void ensureCoefTab(size_t n) {
+    if (dCoefTab && n <= coefCap) return;
+    const size_t want = std::max(n, coefCap * 2);
+    float* neu = nullptr;
+    GPU_CHECK(cudaMalloc(&neu, want * 3 * sizeof(float)));
+    if (dCoefTab) cudaFree(dCoefTab);
+    dCoefTab = neu;
+    coefCap = want;
+    coefMoved = true;
+  }
+
+  void captureGraph() {
+    if (exec) {
+      cudaGraphExecDestroy(exec);
+      exec = nullptr;
+    }
+    if (graph) {
+      cudaGraphDestroy(graph);
+      graph = nullptr;
+    }
+    cudaStream_t s = stream;
+    capturing = true;
+    GPU_CHECK(cudaStreamBeginCapture(s, cudaStreamCaptureModeGlobal));
+    halfStep(0, kModeCFR, 0, s);
+    halfStep(1, kModeCFR, 0, s);
+    advanceCounterK<<<1, 1, 0, s>>>(dCounter);
+    GPU_CHECK(cudaStreamEndCapture(s, &graph));
+    capturing = false;
+    GPU_CHECK(cudaGraphInstantiate(&exec, graph, nullptr, nullptr, 0));
+    {
+      size_t nn = 0;
+      cudaGraphGetNodes(graph, nullptr, &nn);
+      std::fprintf(stderr, "gpu_cfr: graph nodes=%zu\n", nn);
+    }
+    coefMoved = false;
   }
 
   // Disjoint weighted pair mass over the base lists (the EV normalizer).
@@ -971,6 +1025,7 @@ struct NodeH {
   int comboOff1 = 0, nC1 = 0;
   int runOffOff = 0, expOffOff = 0, expIdxBase = 0;
   int ctapBase = 0;  // this node's entries' start in the global ctap
+  int actBase = 0;    // decide nodes: actions' start in the global actFlat
   int64_t pc0 = 0, pc1 = 0;  // inherited (prior-street) contributions
   int nBranch = 0;
   std::vector<int> children;
@@ -994,6 +1049,7 @@ struct Compiler {
   std::vector<int> ctap;
   std::vector<int> expOff;
   std::vector<int> expIdx;
+  std::vector<pf::TreeAction> actFlat;  // decide nodes' labeled actions
   std::map<std::array<uint8_t, 5>, int> boardIds;
   int maxNa = 1;
 
@@ -1199,6 +1255,8 @@ struct Compiler {
     maxNa = std::max(maxNa, nd.na);
     nd.kind = kDecide;
     nd.player = actor;
+    nd.actBase = (int)actFlat.size();
+    for (const auto& act : acts) actFlat.push_back(act);
     for (int a = 0; a < nd.na; ++a) {
       const auto& act = acts[a];
       int child = -1;
@@ -1267,11 +1325,12 @@ struct Compiler {
 
 }  // namespace
 
-GpuPostflopSolver::GpuPostflopSolver(const PostflopSpot& spot,
-                                     const pf::BetConfig& cfg)
-    : impl_(new Impl()) {
+void GpuPostflopSolver::init(const PostflopSpot& spot,
+                             const pf::BetConfig& cfg) {
   Impl* I = impl_;
   I->pot = spot.pot;
+  I->spot = spot;
+  I->cfg = cfg;
   Compiler cc(spot, cfg);
   // Root lists: the base lists themselves.
   const int off0 = 0;
@@ -1682,7 +1741,7 @@ GpuPostflopSolver::GpuPostflopSolver(const PostflopSpot& spot,
     if (nd.kind != kDecide) continue;
     I->decideMeta.push_back({vregOff[u], nd.na, nd.player,
                              nd.player == 0 ? nd.nC0 : nd.nC1, nd.depth,
-                             nd.nBoard});
+                             nd.nBoard, u, nd.actBase});
   }
 
   // Per-fold-node identical-combo maps for foldNode: for each traverser
@@ -1729,6 +1788,16 @@ GpuPostflopSolver::GpuPostflopSolver(const PostflopSpot& spot,
   I->baseCards0 = cc.sides[0].cards;
   I->baseCards1 = cc.sides[1].cards;
   I->sameOther0 = cc.sides[0].sameOther;
+  I->sameOther1 = cc.sides[1].sameOther;
+  // Host copies for tree introspection / per-combo queries / save().
+  I->hChildBase = vchildBase;
+  I->hChildFlat = cc.childFlat;
+  I->hComboId = cc.comboId;
+  I->hComboOff0 = vcomboOff0;
+  I->hComboOff1 = vcomboOff1;
+  I->hNC0 = vnc0;
+  I->hNC1 = vnc1;
+  I->actFlat = cc.actFlat;
   const NodeH& root = cc.nodes[0];
   I->rootNa = root.na;
   I->rootRegOff = rootRegOff;
@@ -1741,7 +1810,15 @@ GpuPostflopSolver::GpuPostflopSolver(const PostflopSpot& spot,
   GPU_CHECK(cudaMemset(I->dCoefDummy, 0, 3 * sizeof(float)));
   GPU_CHECK(cudaMalloc(&I->dCounterDummy, sizeof(int)));
   GPU_CHECK(cudaMemset(I->dCounterDummy, 0, sizeof(int)));
+  GPU_CHECK(cudaMalloc(&I->dCounter, sizeof(int)));
+  GPU_CHECK(cudaMemset(I->dCounter, 0, sizeof(int)));
   GPU_CHECK(cudaStreamCreate(&I->stream));
+}
+
+GpuPostflopSolver::GpuPostflopSolver(const PostflopSpot& spot,
+                                     const pf::BetConfig& cfg)
+    : impl_(new Impl()) {
+  init(spot, cfg);
 }
 
 GpuPostflopSolver::~GpuPostflopSolver() {
@@ -1751,31 +1828,67 @@ GpuPostflopSolver::~GpuPostflopSolver() {
   }
 }
 
+void GpuPostflopSolver::reset() {
+  Impl* I = impl_;
+  iterationsRun_ = 0;
+  totalIters_ = 0;
+  if (I->empty) return;
+  GPU_CHECK(cudaMemsetAsync(I->dRegret, 0, I->regTotal * sizeof(float),
+                            I->stream));
+  GPU_CHECK(cudaMemsetAsync(I->dStrat, 0, I->regTotal * sizeof(float),
+                            I->stream));
+  GPU_CHECK(cudaMemsetAsync(I->dCounter, 0, sizeof(int), I->stream));
+  GPU_CHECK(cudaStreamSynchronize(I->stream));
+}
+
+// Replays the graph in 128-iteration chunks from the current schedule
+// state; the graph itself advances the device counter, and totalIters_
+// stays in lockstep with it.
+void GpuPostflopSolver::replayChunks(int iterations, double target) {
+  Impl* I = impl_;
+  const int chunk = 128;
+  cudaStream_t s = I->stream;
+  int done = 0;
+  while (done < iterations) {
+    const int n = std::min(chunk, iterations - done);
+    for (int t = 0; t < n; ++t) GPU_CHECK(cudaGraphLaunch(I->exec, s));
+    done += n;
+    iterationsRun_ = done;
+    totalIters_ += n;
+    if (target > 0.0 && done < iterations && I->explNow() <= target) break;
+  }
+  GPU_CHECK(cudaStreamSynchronize(s));
+}
+
 void GpuPostflopSolver::solve(int iterations, const std::string& algo,
                               double target) {
   Impl* I = impl_;
   iterationsRun_ = 0;
   if (I->empty) return;
-  cudaStream_t s = I->stream;
+  if (algo != "dcfr" && algo != "hs30")
+    throw std::runtime_error("unknown algo '" + algo +
+                             "' (expected dcfr or hs30)");
+  reset();
+  if (iterations <= 0) return;
+  I->lastAlgo = algo;
   // The schedule (powers of t) is computed in double and stored f32;
   // coefficients are O(1), so the cast is lossless to ~1e-7.
   std::vector<double> tab((size_t)iterations * 3);
   for (int t = 0; t < iterations; ++t)
     discountCoefs(t, iterations, algo, &tab[(size_t)t * 3]);
   std::vector<float> tabF(tab.begin(), tab.end());
-  GPU_CHECK(cudaMalloc(&I->dCoefTab, tabF.size() * sizeof(float)));
+  I->ensureCoefTab((size_t)iterations);
   GPU_CHECK(cudaMemcpy(I->dCoefTab, tabF.data(), tabF.size() * sizeof(float),
                        cudaMemcpyHostToDevice));
-  GPU_CHECK(cudaMalloc(&I->dCounter, sizeof(int)));
-  GPU_CHECK(cudaMemset(I->dCounter, 0, sizeof(int)));
 
-  if (iterations > 0 && std::getenv("GPU_CFR_PROFILE")) {
+  if (std::getenv("GPU_CFR_PROFILE")) {
     // Manual timed iterations instead of the graph: per-depth CUDA
     // event timings for the forward and backward launches, capped so
     // the run stays quick. The per-launch sync serializes work, so
     // absolute times are inflated on launch-bound trees; kernel
     // durations and their ratios are what to read. Shares the launch
     // sequence with halfStep.
+    cudaStream_t s = I->stream;
     const int pit = std::min(iterations, 64);
     cudaEvent_t ev0, ev1;
     GPU_CHECK(cudaEventCreate(&ev0));
@@ -1858,44 +1971,55 @@ void GpuPostflopSolver::solve(int iterations, const std::string& algo,
                  "over %d iters\n",
                  ft / pit, bt / pit, pit);
     iterationsRun_ = pit;
+    totalIters_ += pit;
     return;
   }
 
-  if (iterations > 0) {
-    I->capturing = true;
-    GPU_CHECK(cudaStreamBeginCapture(s, cudaStreamCaptureModeGlobal));
-    I->halfStep(0, kModeCFR, 0, s);
-    I->halfStep(1, kModeCFR, 0, s);
-    advanceCounterK<<<1, 1, 0, s>>>(I->dCounter);
-    GPU_CHECK(cudaStreamEndCapture(s, &I->graph));
-    I->capturing = false;
-    GPU_CHECK(cudaGraphInstantiate(&I->exec, I->graph, nullptr, nullptr, 0));
-    {
-      size_t nn = 0;
-      cudaGraphGetNodes(I->graph, nullptr, &nn);
-      std::fprintf(stderr, "gpu_cfr: graph nodes=%zu\n", nn);
-    }
-    // Replay in chunks; with a target set, check the exploitability
-    // (two BR walks, ~4 iteration-equivalents) after each chunk and
-    // stop early once it crosses the target. The walks never touch the
-    // CFR rows, so resuming replays is sound.
-    const int chunk = 128;
-    int done = 0;
-    while (done < iterations) {
-      const int n = std::min(chunk, iterations - done);
-      for (int t = 0; t < n; ++t) GPU_CHECK(cudaGraphLaunch(I->exec, s));
-      done += n;
-      iterationsRun_ = done;
-      if (target > 0.0 && done < iterations && I->explNow() <= target) {
-        iterationsRun_ = done;
-        break;
-      }
-      iterationsRun_ = done;
-    }
-    GPU_CHECK(cudaStreamSynchronize(s));
-  } else {
-    iterationsRun_ = 0;
+  if (!I->exec || I->coefMoved) I->captureGraph();
+  // Replay in chunks; with a target set, check the exploitability
+  // (two BR walks, ~4 iteration-equivalents) after each chunk and
+  // stop early once it crosses the target. The walks never touch the
+  // CFR rows, so resuming replays is sound.
+  replayChunks(iterations, target);
+}
+
+void GpuPostflopSolver::continueSolve(int iterations, double target) {
+  Impl* I = impl_;
+  iterationsRun_ = 0;
+  if (I->empty) return;
+  if (totalIters_ == 0)
+    throw std::runtime_error("continueSolve: no prior solve() to continue");
+  if (I->lastAlgo != "dcfr")
+    throw std::runtime_error(
+        "continueSolve: the last solve used '" + I->lastAlgo +
+        "', whose schedule depends on the planned iteration count; "
+        "continuation is defined for DCFR only");
+  if (iterations <= 0) return;
+  const int64_t t0 = totalIters_;
+  if (t0 + iterations > (int64_t)std::numeric_limits<int>::max())
+    throw std::runtime_error("continueSolve: schedule index overflow");
+  // DCFR's staircase depends only on the cumulative t, so the schedule
+  // continues exactly where the last solve stopped (the graph has been
+  // advancing the device counter all along). The kernel indexes the
+  // table by the ABSOLUTE counter value, so the table must span
+  // [0, t0+n): entries below t0 are never read again (the counter
+  // never rewinds) and are filled with the t0 coefficients as a guard.
+  const int64_t tEnd = t0 + iterations;
+  std::vector<float> tabF((size_t)tEnd * 3);
+  double c0[3];
+  discountCoefs((int)t0, (int)tEnd, "dcfr", c0);
+  for (int64_t t = 0; t < t0; ++t)
+    for (int k = 0; k < 3; ++k) tabF[(size_t)t * 3 + k] = (float)c0[k];
+  for (int64_t t = t0; t < tEnd; ++t) {
+    double c[3];
+    discountCoefs((int)t, (int)tEnd, "dcfr", c);
+    for (int k = 0; k < 3; ++k) tabF[(size_t)t * 3 + k] = (float)c[k];
   }
+  I->ensureCoefTab((size_t)tEnd);
+  GPU_CHECK(cudaMemcpy(I->dCoefTab, tabF.data(), tabF.size() * sizeof(float),
+                       cudaMemcpyHostToDevice));
+  if (!I->exec || I->coefMoved) I->captureGraph();
+  replayChunks(iterations, target);
 }
 
 pf::NodeStats GpuPostflopSolver::stats() {
@@ -2043,6 +2167,300 @@ std::vector<double> GpuPostflopSolver::rootStrategy() {
     freq[a] = s / z;
   }
   return freq;
+}
+
+int GpuPostflopSolver::numDecideNodes() const {
+  return (int)impl_->decideMeta.size();
+}
+
+DecideNodeInfo GpuPostflopSolver::decideNode(int decideIdx) const {
+  Impl* I = impl_;
+  if (decideIdx < 0 || decideIdx >= (int)I->decideMeta.size())
+    throw std::runtime_error("decide node index " +
+                             std::to_string(decideIdx) + " out of range (" +
+                             std::to_string(I->decideMeta.size()) +
+                             " decide nodes)");
+  const auto& m = I->decideMeta[decideIdx];
+  DecideNodeInfo out;
+  out.nodeId = m.nodeId;
+  out.player = m.player;
+  out.depth = m.depth;
+  out.nBoard = m.nBoard;
+  out.nCombos = m.nC;
+  const int cb = I->hChildBase[m.nodeId];
+  for (int a = 0; a < m.na; ++a) {
+    const pf::TreeAction& act = I->actFlat[m.actBase + a];
+    out.actions.push_back({act.kind, act.amount});
+    out.children.push_back(I->hChildFlat[cb + a]);
+  }
+  return out;
+}
+
+ComboStrategy GpuPostflopSolver::comboStrategy(int decideIdx) {
+  Impl* I = impl_;
+  if (I->empty) throw std::runtime_error("solver compiled to empty ranges");
+  if (decideIdx < 0 || decideIdx >= (int)I->decideMeta.size())
+    throw std::runtime_error("decide node index " +
+                             std::to_string(decideIdx) + " out of range (" +
+                             std::to_string(I->decideMeta.size()) +
+                             " decide nodes)");
+  const auto& m = I->decideMeta[decideIdx];
+  const int nC = m.nC, na = m.na;
+  ComboStrategy out;
+  for (int a = 0; a < na; ++a) {
+    const pf::TreeAction& act = I->actFlat[m.actBase + a];
+    out.actions.push_back({act.kind, act.amount});
+  }
+  const int off =
+      m.player == 0 ? I->hComboOff0[m.nodeId] : I->hComboOff1[m.nodeId];
+  out.combos.assign(I->hComboId.begin() + off, I->hComboId.begin() + off + nC);
+  std::vector<float> rows((size_t)na * nC);
+  GPU_CHECK(cudaMemcpy(rows.data(), I->dStrat + (size_t)m.regOff,
+                       (size_t)na * nC * sizeof(float),
+                       cudaMemcpyDeviceToHost));
+  out.freqs.assign((size_t)na * nC, 0.0);
+  const double uniform = na > 0 ? 1.0 / na : 0.0;
+  for (int c = 0; c < nC; ++c) {
+    double s = 0.0;
+    for (int a = 0; a < na; ++a) s += rows[(size_t)a * nC + c];
+    for (int a = 0; a < na; ++a)
+      out.freqs[(size_t)a * nC + c] =
+          s > 0.0 ? (double)rows[(size_t)a * nC + c] / s : uniform;
+  }
+  return out;
+}
+
+ComboEv GpuPostflopSolver::rootEvPerCombo() {
+  Impl* I = impl_;
+  ComboEv out;
+  if (I->empty) return out;
+  for (int tr = 0; tr < 2; ++tr) {
+    I->halfStep(tr, kModeEV, 1, I->stream);
+    GPU_CHECK(cudaStreamSynchronize(I->stream));
+    const int nBase = tr == 0 ? I->n0Base : I->n1Base;
+    std::vector<float> cfv(nBase);
+    GPU_CHECK(cudaMemcpy(cfv.data(), I->dCfv, (size_t)nBase * sizeof(float),
+                         cudaMemcpyDeviceToHost));
+    // The root reach rows hold the opponent's raw range weights, so
+    // cfv[i] sums the opponent's mass over combos valid against i; the
+    // per-combo EV is cfv[i] over that mass (mirrors pairMass()'s
+    // per-i weight).
+    const std::vector<double>& wOpp = tr == 0 ? I->w1 : I->w0;
+    const std::vector<uint8_t>& cSelf =
+        tr == 0 ? I->baseCards0 : I->baseCards1;
+    const std::vector<uint8_t>& cOpp = tr == 0 ? I->baseCards1 : I->baseCards0;
+    const std::vector<int>& sameOther =
+        tr == 0 ? I->sameOther0 : I->sameOther1;
+    double cardSum[52] = {0.0};
+    double totalOpp = 0.0;
+    for (int j = 0; j < (int)wOpp.size(); ++j) {
+      totalOpp += wOpp[j];
+      cardSum[cOpp[2 * j]] += wOpp[j];
+      cardSum[cOpp[2 * j + 1]] += wOpp[j];
+    }
+    out.combos[tr].resize(nBase);
+    out.ev[tr].resize(nBase);
+    out.mass[tr].resize(nBase);
+    for (int i = 0; i < nBase; ++i) {
+      out.combos[tr][i] = i;
+      double mass = totalOpp - cardSum[cSelf[2 * i]] - cardSum[cSelf[2 * i + 1]];
+      const int so = sameOther[i];
+      if (so >= 0) mass += wOpp[so];
+      out.mass[tr][i] = mass;
+      out.ev[tr][i] = mass > 0.0 ? (double)cfv[i] / mass : 0.0;
+    }
+  }
+  return out;
+}
+
+std::vector<uint8_t> GpuPostflopSolver::playerCards(int player) const {
+  Impl* I = impl_;
+  if (player < 0 || player > 1)
+    throw std::runtime_error("player must be 0 (OOP) or 1 (IP)");
+  return player == 0 ? I->baseCards0 : I->baseCards1;
+}
+
+int GpuPostflopSolver::numBaseCombos(int player) const {
+  Impl* I = impl_;
+  if (player < 0 || player > 1)
+    throw std::runtime_error("player must be 0 (OOP) or 1 (IP)");
+  return player == 0 ? I->n0Base : I->n1Base;
+}
+
+std::vector<double> GpuPostflopSolver::playerWeights(int player) const {
+  Impl* I = impl_;
+  if (player < 0 || player > 1)
+    throw std::runtime_error("player must be 0 (OOP) or 1 (IP)");
+  return player == 0 ? I->w0 : I->w1;
+}
+
+// Solution files: self-describing, little-endian. The tree layout is a
+// deterministic function of (spot, bet config), so only the spot, the
+// config, the schedule state and the two row tables are stored; the
+// load constructor recompiles the tree and validates the layout via
+// the row-table size.
+namespace {
+constexpr uint32_t kSaveMagic = 0x31535050;  // "PPS1"
+constexpr uint32_t kSaveVersion = 1;
+
+void savePut(FILE* f, const void* p, size_t n, const std::string& path) {
+  if (fwrite(p, 1, n, f) != n)
+    throw std::runtime_error("write failed: " + path);
+}
+template <typename T>
+void saveVal(FILE* f, const T& v, const std::string& path) {
+  savePut(f, &v, sizeof(T), path);
+}
+void saveVec(FILE* f, const std::vector<double>& v, const std::string& path) {
+  saveVal<int32_t>(f, (int32_t)v.size(), path);
+  savePut(f, v.data(), v.size() * sizeof(double), path);
+}
+
+struct LoadFile {
+  FILE* f = nullptr;
+  std::string path;
+  explicit LoadFile(const std::string& p) : path(p) {
+    f = std::fopen(p.c_str(), "rb");
+    if (!f) throw std::runtime_error("cannot open solution file: " + p);
+  }
+  ~LoadFile() {
+    if (f) std::fclose(f);
+  }
+  void get(void* p, size_t n) {
+    if (fread(p, 1, n, f) != n)
+      throw std::runtime_error("solution file truncated: " + path);
+  }
+  template <typename T>
+  T val() {
+    T v;
+    get(&v, sizeof(T));
+    return v;
+  }
+  std::vector<double> doubles() {
+    std::vector<double> v((size_t)val<int32_t>());
+    if (v.size() > (size_t)1 << 24)
+      throw std::runtime_error("solution file corrupt: bad length: " + path);
+    get(v.data(), v.size() * sizeof(double));
+    return v;
+  }
+  std::vector<float> floats(size_t n) {
+    std::vector<float> v(n);
+    get(v.data(), n * sizeof(float));
+    return v;
+  }
+};
+}  // namespace
+
+void GpuPostflopSolver::save(const std::string& path) const {
+  Impl* I = impl_;
+  if (I->empty) throw std::runtime_error("cannot save an empty solver");
+  FILE* f = std::fopen(path.c_str(), "wb");
+  if (!f) throw std::runtime_error("cannot open for writing: " + path);
+  try {
+    saveVal<uint32_t>(f, kSaveMagic, path);
+    saveVal<uint32_t>(f, kSaveVersion, path);
+    saveVal<int32_t>(f, I->spot.nBoard, path);
+    savePut(f, I->spot.board, sizeof(I->spot.board), path);
+    saveVal<int64_t>(f, I->spot.pot, path);
+    saveVal<int64_t>(f, I->spot.stack, path);
+    savePut(f, I->spot.oop.w, sizeof(I->spot.oop.w), path);
+    savePut(f, I->spot.ip.w, sizeof(I->spot.ip.w), path);
+    saveVec(f, I->cfg.betFracs, path);
+    saveVec(f, I->cfg.raiseMults, path);
+    saveVal<int8_t>(f, (int8_t)I->cfg.betAllIn, path);
+    saveVal<int8_t>(f, (int8_t)I->cfg.betGeometric, path);
+    saveVal<int32_t>(f, I->cfg.maxRaises, path);
+    saveVal<double>(f, I->cfg.addAllinThreshold, path);
+    saveVal<double>(f, I->cfg.forceAllinThreshold, path);
+    saveVal<double>(f, I->cfg.mergingThreshold, path);
+    saveVal<int64_t>(f, (int64_t)I->numNodes, path);
+    saveVal<int64_t>(f, totalIters_, path);
+    const int32_t algoLen = (int32_t)I->lastAlgo.size();
+    saveVal<int32_t>(f, algoLen, path);
+    savePut(f, I->lastAlgo.data(), I->lastAlgo.size(), path);
+    saveVal<int64_t>(f, (int64_t)I->regTotal, path);
+    std::vector<float> reg(I->regTotal), strat(I->regTotal);
+    GPU_CHECK(cudaMemcpy(reg.data(), I->dRegret, I->regTotal * sizeof(float),
+                         cudaMemcpyDeviceToHost));
+    GPU_CHECK(cudaMemcpy(strat.data(), I->dStrat, I->regTotal * sizeof(float),
+                         cudaMemcpyDeviceToHost));
+    savePut(f, reg.data(), reg.size() * sizeof(float), path);
+    savePut(f, strat.data(), strat.size() * sizeof(float), path);
+    if (std::fflush(f) != 0)
+      throw std::runtime_error("write failed: " + path);
+  } catch (...) {
+    std::fclose(f);
+    throw;
+  }
+  std::fclose(f);
+}
+
+GpuPostflopSolver::GpuPostflopSolver(const std::string& solutionPath)
+    : impl_(new Impl()) {
+  LoadFile lf(solutionPath);
+  if (lf.val<uint32_t>() != kSaveMagic)
+    throw std::runtime_error("not a solution file: " + solutionPath);
+  const uint32_t ver = lf.val<uint32_t>();
+  if (ver != kSaveVersion)
+    throw std::runtime_error("solution file version " + std::to_string(ver) +
+                             " unsupported (expected " +
+                             std::to_string(kSaveVersion) + "): " +
+                             solutionPath);
+  PostflopSpot spot;
+  spot.nBoard = lf.val<int32_t>();
+  if (spot.nBoard < 3 || spot.nBoard > 5)
+    throw std::runtime_error("solution file corrupt: bad board size");
+  lf.get(spot.board, sizeof(spot.board));
+  spot.pot = lf.val<int64_t>();
+  spot.stack = lf.val<int64_t>();
+  lf.get(spot.oop.w, sizeof(spot.oop.w));
+  lf.get(spot.ip.w, sizeof(spot.ip.w));
+  pf::BetConfig cfg;
+  cfg.betFracs = lf.doubles();
+  cfg.raiseMults = lf.doubles();
+  cfg.betAllIn = lf.val<int8_t>() != 0;
+  cfg.betGeometric = lf.val<int8_t>() != 0;
+  cfg.maxRaises = lf.val<int32_t>();
+  cfg.addAllinThreshold = lf.val<double>();
+  cfg.forceAllinThreshold = lf.val<double>();
+  cfg.mergingThreshold = lf.val<double>();
+  lf.val<int64_t>();  // numNodes (informational; regTotal validates)
+  const int64_t savedIters = lf.val<int64_t>();
+  const int32_t algoLen = lf.val<int32_t>();
+  if (algoLen < 0 || algoLen > 15)
+    throw std::runtime_error("solution file corrupt: bad algo length");
+  std::string algo((size_t)algoLen, '\0');
+  lf.get(algo.data(), (size_t)algoLen);
+  if (algo != "dcfr" && algo != "hs30")
+    throw std::runtime_error("solution file corrupt: unknown algo '" +
+                             algo + "'");
+
+  init(spot, cfg);
+  Impl* I = impl_;
+  if (I->empty)
+    throw std::runtime_error(
+        "solution spot compiled to an empty solver (empty or fully "
+        "board-blocked range)");
+  const int64_t regTotal = lf.val<int64_t>();
+  if (regTotal != (int64_t)I->regTotal)
+    throw std::runtime_error(
+        "solution file does not match this engine's compiled tree "
+        "(row table " + std::to_string(regTotal) + " vs " +
+        std::to_string(I->regTotal) +
+        " — different engine version or spot semantics)");
+  if (savedIters < 0 || savedIters > std::numeric_limits<int>::max())
+    throw std::runtime_error("solution file corrupt: bad iteration count");
+  std::vector<float> reg = lf.floats((size_t)regTotal);
+  std::vector<float> strat = lf.floats((size_t)regTotal);
+  GPU_CHECK(cudaMemcpy(I->dRegret, reg.data(), reg.size() * sizeof(float),
+                       cudaMemcpyHostToDevice));
+  GPU_CHECK(cudaMemcpy(I->dStrat, strat.data(), strat.size() * sizeof(float),
+                       cudaMemcpyHostToDevice));
+  const int nextT = (int)savedIters;
+  GPU_CHECK(cudaMemcpy(I->dCounter, &nextT, sizeof(int),
+                       cudaMemcpyHostToDevice));
+  I->lastAlgo = algo;
+  totalIters_ = savedIters;
 }
 
 void GpuPostflopSolver::debugDump() {

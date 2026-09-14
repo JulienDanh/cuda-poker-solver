@@ -60,6 +60,14 @@ deltas.
 
 ## Usage
 
+### Python API
+
+The solver is exposed as a Python package (`python/`, `make python`):
+labeled strategies, per-combo data, save/load and warm-start — see
+[python/README.md](python/README.md).
+
+### CLI (MCCFR preflop engine)
+
 ```
 ./build/ppsolve --seats 8 --stack 1000000 --sb 5000 --bb 10000 --ante 1250 \
     --payouts 0.5,0.3,0.2 --iters 20000 --threads 4 --buckets 15 \

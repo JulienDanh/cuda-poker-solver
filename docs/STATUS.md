@@ -1,7 +1,8 @@
 # Project status
 
 Where the solver stands, what is validated, and what is missing.
-Last updated: perf-phase kickoff (feedback loop, gate noise calibration).
+Last updated: programmatic-interface phase (Python package, save/load,
+warm-start, labeled per-combo queries).
 
 ## 0. Scope
 
@@ -184,6 +185,33 @@ after each step):
    hides gather/scatter latency with 4x more threads per node;
    same lesson as the block-batching experiment (item 4).
 
+13. **Programmatic interface (the `pps` package)**: the engine grew a
+    real API — labeled tree introspection (`decideNode(i)`: player,
+    depth, chip-labeled actions, children), per-combo strategy of ANY
+    decide node (per-combo frequencies need no range weighting, so
+    unlike the old first-street-only aggregate they work past chance
+    nodes), per-combo root EVs with the per-combo opponent mass as the
+    normalizer, `save()`/load-constructor solution files (self-
+    describing: spot + config + rows + schedule state; the load
+    recompiles the deterministic tree and validates it via the row
+    count), warm-start `continueSolve()` (DCFR's staircase depends
+    only on the cumulative t, so continuation follows the same
+    trajectory as one long solve — verified by test), and `reset()`.
+    Two engine bugs found and fixed while building it: the coef table
+    is indexed by the ABSOLUTE counter value, so a continuation must
+    upload a table spanning [0, t0+n), not a dense [t0, t0+n) block;
+    and the per-solve dCoefTab/dCounter (re)allocation is now managed
+    (`ensureCoefTab` + graph recapture when the pointer moves). The
+    Python layer is `python/` (`make python`, `make python-test`,
+    pybind11 + numpy): `pps.Solver(board, oop, ip, pot, stack, ...)` →
+    `solve(max_iters, target=)`, `strategy(i)`, `decide_nodes()`,
+    `root_ev()`, `save`/`load`/`continue_solve`/`reset`, with ranges
+    as postflop-solver strings, dicts or raw 1326-weight lists. The
+    8-test suite gates the invariants the oracle gates can't (per-combo
+    normalization, EV aggregation vs stats(), save/load roundtrip
+    equality, warm-start trajectory equality). Perf-loop green before
+    commit (no regression: 0.999-1.030x).
+
 Cumulative turn throughput: ~4.0x (wide 193 -> ~785, standard 1401 ->
 ~4,730, shortstack 96 -> ~87 us/iter); practical flop 56 -> ~58
 iters/s (1500 stack) and 201 -> ~211 (500 stack).
@@ -216,12 +244,14 @@ iters/s (1500 stack) and 201 -> ~211 (500 stack).
    (`make gpu-quick`/`gpu-parity`) and `turn-bench` cover turn only, by
    decision, until the turn perf work lands. The oracle flop solves are
    also ~50x the turn cost per iteration, which would slow the loop.
-3. **Strategy output** — the root aggregate (`--root`) and the
-   range-weighted average strategy of any first-street decide node
-   (`--strat <idx>`, 0 = root, 1 = IP after OOP checks) are exposed;
-   deeper (chance-compacted) nodes would need reach-weighted averaging
-   and return nothing. Still missing: save/load of trained solutions,
-   a spot-query interface.
+3. **Strategy output** — the practical interface landed: labeled
+   actions, per-combo strategies at any decide node, per-combo root
+   EVs, save/load and warm-start (`pps` package, item 13). Still
+   missing: a range-weighted aggregate at deeper (chance-compacted)
+   nodes (needs reach-weighted averaging over the tree), and querying
+   a node's position in the action sequence (e.g. "after bet-call on
+   the turn") — callers currently identify nodes by decide index or
+   tree structure via `decide_nodes()`.
 4. **Exploitability** is measured per solve (EV + BR walk) but there is
    no multiway (3+ player) support at all in the GPU engine.
 5. **No continuous integration**; the gates are run manually.
@@ -234,6 +264,7 @@ workflow for any change to the GPU engine:
     make perf-loop            # the perf feedback loop (~13 s, see below)
     make gpu-parity           # full commit gate (~15 s)
     make turn-bench           # before/after numbers
+    make python-test          # pps package API tests (see python/)
 
 - `make perf-loop` — the performance feedback loop, one command: rebuild
   `build-cuda`, run the quick gate, run `turn-bench`, then compare
