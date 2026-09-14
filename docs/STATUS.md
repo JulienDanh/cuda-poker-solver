@@ -63,9 +63,9 @@ a redundant middle rung. Its bet-tree construction lives on as
 
 | spot | nodes | compile | solve | iters/s |
 |---|---|---|---|---|
-| shortstack (all-in runout) | 537 | ~195 ms | 101 us/iter | ~9,900 |
-| standard (200 pot, 500 stack) | 5,943 | ~205 ms | 237 us/iter | ~4,200 |
-| wide/deep (1500 stack, 4+ sizes) | 51,903 | ~230 ms | ~1,400 us/iter | ~700 |
+| shortstack (all-in runout) | 537 | ~195 ms | 94 us/iter | ~10,600 |
+| standard (200 pot, 500 stack) | 5,943 | ~205 ms | 215 us/iter | ~4,650 |
+| wide/deep (1500 stack, 4+ sizes) | 51,903 | ~230 ms | ~1,310 us/iter | ~735-795 |
 
 Per-iteration cost is dominated by the solve replay; compile is a fixed
 ~200 ms (mostly CUDA context init on WSL); the stats walk is single-digit
@@ -84,9 +84,22 @@ after each step):
    the serial node loop with block-wide syncs destroyed cross-node
    concurrency. Block launch/scheduling is not the bottleneck; the
    remaining cost is the per-node base-space work itself.
+5. **Showdown/fold reverse-map fusion**: the terminal kernels no longer
+   stage reach in base space. The showdown gathers raw reach in
+   strength-sorted order straight from the node's compact list through
+   a per-(board, traverser) reverse map (sorted position -> combo
+   index, -1 for runout-blocked slots; combo lists are board-canonical,
+   verified at compile), fusing the zero/scatter/gather passes into
+   one and the scan into an out-of-place variant (2 fewer passes and
+   syncs). Fold scatters per-card sums directly from the compact list
+   (the atomics loop now runs over nOppNode, not nOppBase) and reads
+   the identical-combo correction through a per-node foldSon map.
+   +12% standard, +5% wide/deep/shortstack. The maps are tiny: the
+   showdown table is per interned river board (~66 KB), foldSon is
+   per fold node (~12 MB on the 52k-node tree).
 
-Cumulative turn throughput: ~3.5x (wide 193 -> ~700, standard 1401 ->
-~4,200 iters/s).
+Cumulative turn throughput: ~3.7x (wide 193 -> ~735, standard 1401 ->
+~4,650 iters/s).
 
 ### Bugs found by validation so far (all fixed)
 
@@ -106,29 +119,23 @@ Cumulative turn throughput: ~3.5x (wide 193 -> ~700, standard 1401 ->
 
 ## 2. What is missing (turn focus, highest impact first)
 
-1. **Showdown base-space walk** — the identified next perf lever. Every
-   showdown node zeroes/loads its opponent reach over the full base range
-   and block-scans it in strength-sorted order (plus a separate gather
-   pass). A precomputed per-node reverse map (base slot -> node-local
-   index) would fuse the zero/gather passes and drop two syncs; the
-   card-correction loops can read through the same map.
-2. **Launch-bound small trees** — the ~61-graph-node replay costs
+1. **Launch-bound small trees** — the ~61-graph-node replay costs
    ~100 us on WSL regardless of tree size (the shortstack spot is pure
    floor). Fusing the same-depth forward decide+chance kernels and the
    per-depth backward dispatch would cut graph nodes ~30%.
-3. **Flop spots** — engine support exists (3-card boards), but gates
+2. **Flop spots** — engine support exists (3-card boards), but gates
    (`make gpu-quick`/`gpu-parity`) and `turn-bench` cover turn only, by
    decision, until the turn perf work lands. The oracle flop solves are
    also ~50x the turn cost per iteration, which would slow the loop.
-4. **Strategy output** — the root aggregate (`--root`) and the
+3. **Strategy output** — the root aggregate (`--root`) and the
    range-weighted average strategy of any first-street decide node
    (`--strat <idx>`, 0 = root, 1 = IP after OOP checks) are exposed;
    deeper (chance-compacted) nodes would need reach-weighted averaging
    and return nothing. Still missing: save/load of trained solutions,
    a spot-query interface.
-5. **Exploitability** is measured per solve (EV + BR walk) but there is
+4. **Exploitability** is measured per solve (EV + BR walk) but there is
    no multiway (3+ player) support at all in the GPU engine.
-6. **No continuous integration**; the gates are run manually.
+5. **No continuous integration**; the gates are run manually.
 
 ## 3. Quality harness (the gates)
 
@@ -174,15 +181,12 @@ parity" before a commit. The tiny ground truth is engine-independent
 
 ## 4. Recommended next steps
 
-1. **Showdown reverse-map fusion** (item 1 above): precompute per
-   showdown node a base-slot -> local-index map (~13 MB for a 52k-node
-   tree), fuse the zero+fill+gather passes, route the card-correction
-   reads through it. Measure with `make turn-bench`, gate with
-   `make gpu-quick`.
-2. Forward kernel fusion for the graph-node count (item 2), if small
-   trees matter.
-3. Then flop spots: add 3-card boards back to the gates with
+1. **Forward kernel fusion for the graph-node count** (item 1), if
+   small trees matter: fuse the same-depth forward decide+chance
+   kernels and the per-depth backward dispatch (~30% fewer graph
+   nodes; the shortstack spot is launch-bound).
+2. Then flop spots: add 3-card boards back to the gates with
    `pfs-verify solve` (already exposed), at reduced iteration counts
    (the oracle flop solve is ~30 s at 300 iterations).
-4. Then: save-load of trained solutions / spot query (item 4; the
+3. Then: save-load of trained solutions / spot query (item 3; the
    per-node first-street strategy query `--strat` landed).

@@ -10,7 +10,9 @@
 //     backward expands per-combo via a CSR over (branch, child slot)
 //   - per-river-board strength tables (sorted orders, less/tie
 //     boundaries, per-card position lists for the conflict corrections)
-//   - terminal kernels work in base combo space through a shared array
+//   - terminal kernels read the compact combo lists directly through
+//     per-board reverse maps (showdown) and a per-node identical-combo
+//     map (fold); no base-space staging array
 #include "gpu_cfr.h"
 
 #include "cards.h"
@@ -60,14 +62,17 @@ __device__ __forceinline__ float warpInclScan(float v, int lane) {
   return v;
 }
 
-__device__ void blockScanInc(float* arr, int n) {
+// Out-of-place inclusive block scan: dst[k] = sum_{i<=k} src[i]. The
+// showdown keeps src (raw sorted reach) for the card-correction reads,
+// so scanning into a second array saves a separate copy pass + sync.
+__device__ void blockScanIncTo(const float* src, float* dst, int n) {
   const int tid = threadIdx.x;
   const int nthr = blockDim.x;
   const int chunk = (n + nthr - 1) / nthr;
   const int lo = tid * chunk;
   const int hi = lo + chunk < n ? lo + chunk : n;
   float local = 0.0f;
-  for (int k = lo; k < hi; ++k) local += arr[k];
+  for (int k = lo; k < hi; ++k) local += src[k];
   __shared__ float warpSum[32];
   const int warp = tid >> 5;
   const int lane = tid & 31;
@@ -84,8 +89,8 @@ __device__ void blockScanInc(float* arr, int n) {
   float pre = warp > 0 ? warpSum[warp - 1] : 0.0f;
   float run = pre + incl - local;
   for (int k = lo; k < hi; ++k) {
-    run += arr[k];
-    arr[k] = run;
+    run += src[k];
+    dst[k] = run;
   }
 }
 
@@ -176,6 +181,16 @@ struct TreeBuf {
   const int* brTieEnd;
   const int* brCardPosOff;  // per table: 53 offsets into brCardPosIdx
   const int* brCardPosIdx;
+  // per (board, traverser): sorted position -> node-local combo index of
+  // that base slot, or -1 when the runout blocked the combo. Lets the
+  // showdown gather raw reach straight from the compact list.
+  const int* brRevSortedOff;
+  const int* brRevSorted;
+  // per fold node: for each traverser combo, the node-local index of
+  // the identical opponent combo in this node's opponent list (-1 if
+  // the side has no such combo at all).
+  const int* foldSonOff;
+  const int* foldSon;
   int n0Base, n1Base;
   int64_t pot;
 };
@@ -288,42 +303,29 @@ __global__ void fwdChanceK(const int* __restrict__ nodes, int count,
 // Backward node handlers (one block per node, dispatched on kind).
 // ---------------------------------------------------------------------------
 
-// Loads the node's opponent reach into base space: shOpp[baseId] = reach,
-// zero elsewhere. nOppBase doubles of shared.
-__device__ __forceinline__ void loadOppBase(const TreeBuf& b, int node,
-                                           int opp, float* shOpp,
-                                           int nOppBase) {
-  for (int k = threadIdx.x; k < nOppBase; k += blockDim.x) shOpp[k] = 0.0f;
-  __syncthreads();
-  const int n = nOfP(b, node, opp);
-  const int comboOff = comboOffP(b, node, opp);
-  const float* r = b.reach + (size_t)b.reachOff[node];
-  for (int j = threadIdx.x; j < n; j += blockDim.x)
-    shOpp[b.comboId[comboOff + j]] = r[j];
-  __syncthreads();
-}
-
 __device__ void showdownNode(int node, int tr, TreeBuf b,
-                             float* shOpp, float* shScan) {
+                             float* shRaw, float* shScan) {
   const int opp = 1 - tr;
   const int nOppBase = opp == 0 ? b.n0Base : b.n1Base;
-  loadOppBase(b, node, opp, shOpp, nOppBase);
   const int tIdx = b.boardId[node] * 2 + tr;
   const int* oppSorted = b.brOppSorted + b.brOppSortedOff[tIdx];
+  const int* rev = b.brRevSorted + b.brRevSortedOff[tIdx];
   const int lessOff = b.brLessOff[tIdx];
   const int* lessEnd = b.brLessEnd + lessOff;
   const int* tieEnd = b.brTieEnd + lessOff;
   const int* cardPosOff = b.brCardPosOff + (size_t)tIdx * 53;
   const int* cardPosIdx = b.brCardPosIdx;
-  // Scan the opponent reach in strength-sorted base order.
-  {
-    const int chunk = (nOppBase + blockDim.x - 1) / blockDim.x;
-    const int lo = threadIdx.x * chunk;
-    const int hi = lo + chunk < nOppBase ? lo + chunk : nOppBase;
-    for (int k = lo; k < hi; ++k) shScan[k] = shOpp[oppSorted[k]];
+  const float* r = b.reach + (size_t)b.reachOff[node];
+  // Fused zero/scatter/gather: raw opponent reach in strength-sorted
+  // order, one pass straight from the compact list. Combos blocked by
+  // the runout read 0 through the per-board reverse map; no base-space
+  // staging array, no separate zero pass.
+  for (int k = threadIdx.x; k < nOppBase; k += blockDim.x) {
+    const int j = rev[k];
+    shRaw[k] = j >= 0 ? r[j] : 0.0f;
   }
   __syncthreads();
-  blockScanInc(shScan, nOppBase);
+  blockScanIncTo(shRaw, shScan, nOppBase);
   __syncthreads();
   const float total = nOppBase > 0 ? shScan[nOppBase - 1] : 0.0f;
   const int64_t sc0 = b.sc0[node];
@@ -352,7 +354,7 @@ __device__ void showdownNode(int node, int tr, TreeBuf b,
       const uint8_t c = ci == 0 ? c1 : c2;
       for (int q = cardPosOff[c]; q < cardPosOff[c + 1]; ++q) {
         const int pos = cardPosIdx[q];
-        if (pos < le) lm -= shOpp[oppSorted[pos]];
+        if (pos < le) lm -= shRaw[pos];
       }
     }
     if (lm < 0.0f) lm = 0.0f;
@@ -362,7 +364,7 @@ __device__ void showdownNode(int node, int tr, TreeBuf b,
       const uint8_t c = ci == 0 ? c1 : c2;
       for (int q = cardPosOff[c]; q < cardPosOff[c + 1]; ++q) {
         const int pos = cardPosIdx[q];
-        if (pos >= te) gm -= shOpp[oppSorted[pos]];
+        if (pos >= te) gm -= shRaw[pos];
       }
     }
     if (gm < 0.0f) gm = 0.0f;
@@ -373,29 +375,29 @@ __device__ void showdownNode(int node, int tr, TreeBuf b,
       const int o = oppSorted[pos];
       const uint8_t oc1 = cardsOpp[2 * o];
       const uint8_t oc2 = cardsOpp[2 * o + 1];
-      if (oc1 == c1 || oc1 == c2 || oc2 == c1 || oc2 == c2) tm -= shOpp[o];
+      if (oc1 == c1 || oc1 == c2 || oc2 == c1 || oc2 == c2) tm -= shRaw[pos];
     }
     out[i] = lm * winV + tm * tieV + gm * loseV;
   }
 }
 
-__device__ void foldNode(int node, int tr, TreeBuf b, float* shOpp) {
+__device__ void foldNode(int node, int tr, TreeBuf b) {
   const int opp = 1 - tr;
-  const int nOppBase = opp == 0 ? b.n0Base : b.n1Base;
-  loadOppBase(b, node, opp, shOpp, nOppBase);
-  __shared__ float cardSum[52];
   const int nOppNode = nOfP(b, node, opp);
   const int comboOff = comboOffP(b, node, opp);
   const uint8_t* cardsOpp = opp == 0 ? b.cards0 : b.cards1;
   const float* r = b.reach + (size_t)b.reachOff[node];
-  // Base-space per-card sums via shOpp (blocked base slots hold 0):
-  // each combo scatters its reach to its two cards (shared atomics)
-  // instead of 52 threads each scanning the whole base range.
+  __shared__ float cardSum[52];
+  // Per-card sums straight from the compact list: each combo scatters
+  // its reach to its two cards (shared atomics). No base-space staging:
+  // blocked combos never enter, and the identical-combo correction
+  // reads the same reach row through the per-node foldSon map.
   if (threadIdx.x < 52) cardSum[threadIdx.x] = 0.0f;
   __syncthreads();
-  for (int j = threadIdx.x; j < nOppBase; j += blockDim.x) {
-    atomicAdd(&cardSum[cardsOpp[2 * j]], shOpp[j]);
-    atomicAdd(&cardSum[cardsOpp[2 * j + 1]], shOpp[j]);
+  for (int j = threadIdx.x; j < nOppNode; j += blockDim.x) {
+    const int baseId = b.comboId[comboOff + j];
+    atomicAdd(&cardSum[cardsOpp[2 * baseId]], r[j]);
+    atomicAdd(&cardSum[cardsOpp[2 * baseId + 1]], r[j]);
   }
   __syncthreads();
   float tot = 0.0f;
@@ -410,16 +412,17 @@ __device__ void foldNode(int node, int tr, TreeBuf b, float* shOpp) {
           : ((float)(b.potBase[node] + sc) -
              (float)(tr == 0 ? b.pc0[node] : b.pc1[node]));
   const uint8_t* cardsTr = tr == 0 ? b.cards0 : b.cards1;
-  const int* sameOther = tr == 0 ? b.sameOther0 : b.sameOther1;
   const int nTrNode = nOfP(b, node, tr);
+  const int* son =
+      b.foldSon + b.foldSonOff[node] + (tr == 0 ? 0 : nOfP(b, node, 0));
   const int trComboOff = comboOffP(b, node, tr);
   float* out = b.cfvRW + (size_t)b.reachOff[node];
   for (int i = threadIdx.x; i < nTrNode; i += blockDim.x) {
     const int baseId = b.comboId[trComboOff + i];
     float w = tot - cardSum[cardsTr[2 * baseId]] -
               cardSum[cardsTr[2 * baseId + 1]];
-    const int so = sameOther[baseId];
-    if (so >= 0) w += shOpp[so];  // identical combo subtracted twice
+    const int j2 = son[i];
+    if (j2 >= 0) w += r[j2];  // identical combo subtracted twice
     if (w < 0.0f) w = 0.0f;
     out[i] = w * v;
   }
@@ -536,7 +539,7 @@ __global__ void bwdDepthK(const int* __restrict__ nodes, int count, int tr,
   if (kind == kShowdown) {
     showdownNode(node, tr, b, sh, sh + nOppBase);
   } else if (kind == kFold) {
-    foldNode(node, tr, b, sh);
+    foldNode(node, tr, b);
   } else if (kind == kChance) {
     chanceNodeBwd(node, tr, b);
   } else {
@@ -643,6 +646,10 @@ struct GpuPostflopSolver::Impl {
   int* dBrTieEnd = nullptr;
   int* dBrCardPosOff = nullptr;
   int* dBrCardPosIdx = nullptr;
+  int* dBrRevSortedOff = nullptr;
+  int* dBrRevSorted = nullptr;
+  int* dFoldSonOff = nullptr;
+  int* dFoldSon = nullptr;
 
   float* dCoefTab = nullptr;
   float* dCoefDummy = nullptr;
@@ -724,6 +731,10 @@ struct GpuPostflopSolver::Impl {
     b.brTieEnd = dBrTieEnd;
     b.brCardPosOff = dBrCardPosOff;
     b.brCardPosIdx = dBrCardPosIdx;
+    b.brRevSortedOff = dBrRevSortedOff;
+    b.brRevSorted = dBrRevSorted;
+    b.foldSonOff = dFoldSonOff;
+    b.foldSon = dFoldSon;
     b.n0Base = n0Base;
     b.n1Base = n1Base;
     b.pot = pot;
@@ -871,6 +882,10 @@ struct GpuPostflopSolver::Impl {
     kill(dBrTieEnd);
     kill(dBrCardPosOff);
     kill(dBrCardPosIdx);
+    kill(dBrRevSortedOff);
+    kill(dBrRevSorted);
+    kill(dFoldSonOff);
+    kill(dFoldSon);
     kill(dCoefTab);
     kill(dCoefDummy);
     kill(dCounter);
@@ -1410,6 +1425,8 @@ GpuPostflopSolver::GpuPostflopSolver(const PostflopSpot& spot,
     const int nTables = (int)cc.boardIds.size() * 2;
     std::vector<int> tOppSortedOff(nTables + 1, 0);
     std::vector<int> tOppSorted;
+    std::vector<int> tRevSortedOff(nTables + 1, 0);
+    std::vector<int> tRevSorted;
     std::vector<int> tLessOff(nTables + 1, 0);
     std::vector<int> tLessEnd, tTieEnd;
     std::vector<int> tCardPosOff(nTables * 53 + 1, 0);
@@ -1445,6 +1462,27 @@ GpuPostflopSolver::GpuPostflopSolver(const PostflopSpot& spot,
         });
         tOppSortedOff[tIdx] = (int)tOppSorted.size();
         for (int i = 0; i < nOpp; ++i) tOppSorted.push_back(os[i]);
+        // Reverse map (sorted position -> node-local combo index, or -1
+        // for combos the runout blocked). Every showdown node with this
+        // board carries exactly the canonical list — base minus combos
+        // containing a card dealt after the spot board; verified after
+        // the tree build — so one table per (board, traverser) serves
+        // all showdown nodes and the kernel can gather raw reach
+        // straight from each node's compact list.
+        std::vector<int> jOf(nOpp, -1);
+        {
+          int j = 0;
+          for (int i = 0; i < nOpp; ++i) {
+            bool blocked = false;
+            for (int c = spot.nBoard; c < 5; ++c)
+              if (cc.sides[opp].cards[2 * i] == b5[c] ||
+                  cc.sides[opp].cards[2 * i + 1] == b5[c])
+                blocked = true;
+            if (!blocked) jOf[i] = j++;
+          }
+        }
+        tRevSortedOff[tIdx] = (int)tRevSorted.size();
+        for (int k = 0; k < nOpp; ++k) tRevSorted.push_back(jOf[os[k]]);
         tLessOff[tIdx] = (int)tLessEnd.size();
         for (int i = 0; i < nTr; ++i) {
           uint64_t s = st[tr][i];
@@ -1489,6 +1527,44 @@ GpuPostflopSolver::GpuPostflopSolver(const PostflopSpot& spot,
     upload(I->dBrTieEnd, tTieEnd);
     upload(I->dBrCardPosOff, tCardPosOff);
     upload(I->dBrCardPosIdx, tCardPosIdx);
+    upload(I->dBrRevSortedOff, tRevSortedOff);
+    upload(I->dBrRevSorted, tRevSorted);
+  }
+
+  // The showdown gather routes reads through the per-board reverse map,
+  // which assumes every showdown node's combo lists equal the canonical
+  // lists for its interned board. Chance compaction is deterministic —
+  // each deal only removes combos containing the dealt card, in base
+  // order — so this always holds; verify once so a future tree change
+  // cannot silently corrupt the showdown values.
+  for (int u = 0; u < I->numNodes; ++u) {
+    const NodeH& nd = cc.nodes[u];
+    if (nd.kind != kShowdown) continue;
+    for (int p = 0; p < 2; ++p) {
+      const SideH& sd = cc.sides[p];
+      const int off = p == 0 ? nd.comboOff0 : nd.comboOff1;
+      const int n = p == 0 ? nd.nC0 : nd.nC1;
+      int j = 0;
+      bool ok = true;
+      for (int i = 0; i < sd.n && ok; ++i) {
+        bool blocked = false;
+        for (int c = spot.nBoard; c < 5; ++c)
+          if (sd.cards[2 * i] == nd.board[c] ||
+              sd.cards[2 * i + 1] == nd.board[c])
+            blocked = true;
+        if (!blocked) {
+          ok = j < n && cc.comboId[off + j] == i;
+          ++j;
+        }
+      }
+      if (!ok || j != n) {
+        std::fprintf(stderr,
+                     "gpu_cfr: showdown node %d combo list deviates from "
+                     "its board's canonical list\n",
+                     u);
+        std::exit(1);
+      }
+    }
   }
 
   // Decide-node table for the strategy seeder.
@@ -1498,6 +1574,44 @@ GpuPostflopSolver::GpuPostflopSolver(const PostflopSpot& spot,
     I->decideMeta.push_back({vregOff[u], nd.na, nd.player,
                              nd.player == 0 ? nd.nC0 : nd.nC1, nd.depth,
                              nd.nBoard});
+  }
+
+  // Per-fold-node identical-combo maps for foldNode: for each traverser
+  // combo, the node-local index of the same two cards in this node's
+  // opponent list (or -1). The lists are strictly increasing in base
+  // slot, so the lookup is a binary search at compile time.
+  {
+    std::vector<int> vFoldSonOff(I->numNodes, 0), vFoldSon;
+    for (int u = 0; u < I->numNodes; ++u) {
+      const NodeH& nd = cc.nodes[u];
+      if (nd.kind != kFold) continue;
+      vFoldSonOff[u] = (int)vFoldSon.size();
+      for (int p = 0; p < 2; ++p) {
+        const int off = p == 0 ? nd.comboOff0 : nd.comboOff1;
+        const int n = p == 0 ? nd.nC0 : nd.nC1;
+        const int offOpp = p == 0 ? nd.comboOff1 : nd.comboOff0;
+        const int nOppL = p == 0 ? nd.nC1 : nd.nC0;
+        for (int i = 0; i < n; ++i) {
+          const int baseId = cc.comboId[off + i];
+          const int so = cc.sides[p].sameOther[baseId];
+          int son = -1;
+          if (so >= 0) {
+            int lo = 0, hi = nOppL;
+            while (lo < hi) {
+              const int mid = (lo + hi) / 2;
+              if (cc.comboId[offOpp + mid] < so)
+                lo = mid + 1;
+              else
+                hi = mid;
+            }
+            if (lo < nOppL && cc.comboId[offOpp + lo] == so) son = lo;
+          }
+          vFoldSon.push_back(son);
+        }
+      }
+    }
+    upload(I->dFoldSonOff, vFoldSonOff);
+    upload(I->dFoldSon, vFoldSon);
   }
 
   // Host copies for stats.
